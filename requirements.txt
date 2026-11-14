@@ -1,0 +1,5 @@
+# PyTorch model of MEGA (mega_pt/). Tested with: torch 2.15.0, numpy 2.x, scipy 1.x, Python 3.13.
+torch>=2.2
+numpy>=1.26
+scipy>=1.11
+pytest>=8

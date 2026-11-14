@@ -85,6 +85,10 @@ and Tab.VI gives accuracy/bitwidth targets. The simulator depends on most of §V
 where many open questions remain. `04-open-questions.md` tags each question with
 the path(s) it blocks: `[PT]` = PyTorch model, `[SIM]` = simulator.
 
+**Status (2026-11-14):** the PyTorch model for GCN on Cora, CiteSeer and PubMed is in
+[`mega_pt/`](../../mega_pt/README.md). Its design decisions are in `04-open-questions.md`
+(Q-01–Q-15), and its implementation-level choices are in `mega_pt/README.md`.
+
 ## Working notes
 
 - Verified transcriptions: Fig.14/16/17 MEGA values reproduce the paper's stated geomeans
