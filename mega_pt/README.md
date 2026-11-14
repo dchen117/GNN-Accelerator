@@ -102,6 +102,25 @@ and the measurement is given.
 | Dropout after the quantizer | Applying dropout's 1/(1−p) rescale before the quantizer would make the quantizer see different values in training and eval, which biases α. |
 | Reported epoch = last QAT epoch | b is still moving during QAT. Best-validation selection could report bits that differ from the final model. |
 
+## Results log
+
+### 2026-11-14 — Q-11 normalization comparison, Cora, 3 seeds, λ=1e-5, dense target 2.0 bits
+
+| `--norm` | q_test (%) | avg_bits_sparse | CR | B lost, top-1% deg (L0 / L1) | max AU psum (L0 / L1) |
+|---|---|---|---|---|---|
+| fp32 (ideal Ã) | 80.27 ± 0.50 | 1.88 | 17.0× | 33% / 13% | n/a |
+| fold | **80.93 ± 0.76** | 1.91 | 16.8× | **65% / 28%** | 378 / 420 |
+| per_source f=8 | 80.37 ± 0.40 | 1.89 | 17.0× | 32% / 13% | **49,822 / 22,307 (overflows 16 bit)** |
+| per_source f=4 | 80.77 ± 0.46 | 1.85 | 17.4× | 32% / 14% | 3,104 / 1,389 |
+
+FP32 for the same seeds: 81.50 ± 0.82. Tab.VI reports 81.5 ± 0.7 (FP32) and 80.9 ± 0.6 at 1.70 bits.
+
+- **As predicted, fold loses more B on high-degree rows** (65% vs 33%), but it costs no accuracy on
+  Cora. It meets the Q-11 decision rule here.
+- **per_source with f=8 overflows signed 16-bit partial sums.** f=4 fits, with no accuracy loss.
+- **Caveat:** Cora's maximum degree is 169. The rule also requires NELL and Reddit, where
+  high-degree nodes are common, before Q-11 is closed. Three seeds is a small sample.
+
 ## Known limitations / next steps
 
 - **b convergence:** Adam moves b by about `--lr-bits` per step, so 200 epochs allow about 2 bits

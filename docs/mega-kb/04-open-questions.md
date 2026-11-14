@@ -177,6 +177,9 @@ The paper is never "corrected" here. Possible readings are listed but not chosen
     overflowing 16-bit partial sums. Also test on NELL/Reddit, where high-degree nodes are
     common, against our own FP32 baseline.
   - The PyTorch model implements all three modes (`--norm fp32|fold|per_source`).
+  - **Interim result (2026-11-14, Cora, 3 seeds; table in `mega_pt/README.md`):** fold 80.93 ± 0.76
+    vs ideal-Ã 80.27 ± 0.50, so fold meets the rule on Cora. per_source f=8 overflows 16-bit
+    partial sums (max 49,822); f=4 fits (3,104). Not closed: NELL/Reddit still to test.
 
 ### Q-12 — Model-specific operators (GIN, GraphSage) `[PT][SIM]` blocking
 - Says: GCN/GIN/GraphSage "can be uniformly represented" by Eq.(1) (p.3). Tab.III: GIN uses Add
