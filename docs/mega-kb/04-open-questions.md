@@ -1,6 +1,6 @@
 # 04 — Open Questions, Gaps, and Inconsistencies
 
-**Status (2026-11-14):** Q-01–Q-15 have decisions (Q-11 is "pending test"). Q-16 onward are
+**Status (2026-11-15):** Q-01–Q-15 have decisions (Q-11 decided as fold on Cora + NELL; Reddit pending). Q-16 onward are
 open. The PyTorch model implementing them is in `mega_pt/`.
 
 Each entry lists what the paper says (with citations), what is missing or conflicting, and
@@ -159,7 +159,7 @@ The paper is never "corrected" here. Possible readings are listed but not chosen
   - Trade-off: X⁽⁰⁾ dominates Eq.(4) (e.g. Cora 1433 vs 128 dims), so the memory penalty mostly
     acts on the input layer.
 
-### Q-11 — Adjacency normalization and edge weights `[PT][SIM]` blocking
+### Q-11 — Adjacency normalization and edge weights `[PT][SIM]` decided (fold; Reddit pending)
 - Says: Eq.(1) uses normalized Ã (p.3). §IV says A ∈ {0,1}^(N×N) (p.5). §V-D: features are
   "multiplied with the corresponding edge weight of A broadcasted to each AU, which is stored
   in the Edge Buffer using the CSC format" (p.8). AUs do "integer addition and
@@ -191,6 +191,16 @@ The paper is never "corrected" here. Possible readings are listed but not chosen
   - **Interim result (2026-11-14, Cora, 3 seeds; table in `mega_pt/README.md`):** fold 80.93 ± 0.76
     vs ideal-Ã 80.27 ± 0.50, so fold meets the rule on Cora. per_source f=8 overflows 16-bit
     partial sums (max 49,822); f=4 fits (3,104). Not closed: NELL/Reddit still to test.
+  - **Decision (2026-11-15): fold**, by the rule above. Reconfirm on Reddit (not run).
+    - NELL result (3 seeds, λ = 0; table in `mega_pt/README.md`): fold 55.87 ± 9.87 vs ideal Ã
+      54.56 ± 5.05 vs per_source f=4 38.53 ± 1.29 (FP32 model: 60.85 ± 2.40).
+    - per_source is ruled out on NELL. Q1.4 rounds w to 0 for degree > 1,024: 21 hubs, which
+      source 12% of the edges. f ≥ 6 fixes that, but [DERIVED estimate] multiplies the measured
+      f=4 L0 partial sum (29,897) by about 4, past the 16-bit accumulator (Q-25).
+    - Not closed:
+      - Reddit is untested. It needs GraphSage (Q-12), and its download host is blocked here.
+      - NELL QAT itself is noisy (one seed collapses in every mode).
+    - The per-source w table and AU-reuse design above stay documented as the fallback.
 
 ### Q-12 — Model-specific operators (GIN, GraphSage) `[PT][SIM]` blocking
 - Says: GCN/GIN/GraphSage "can be uniformly represented" by Eq.(1) (p.3). Tab.III: GIN uses Add

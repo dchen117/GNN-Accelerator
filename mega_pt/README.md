@@ -181,6 +181,32 @@ Diagnosis so far:
 - Next things to try: better X initialization than max/7 (e.g. MSE- or percentile-based
   clip), longer QAT at a lower bits learning rate, and Eq.(4) normalized per layer.
 
+### 2026-11-15 — Q-11 normalization comparison on NELL, 3 seeds, λ = 0
+
+Setting: `--feat-norm row --dropout 0.1 --wd 1e-5 --epochs-fp32 400 --lr-bits 2e-2` (our default
+recipe gets only 57.2% FP32 on NELL; see Q-14). NELL's maximum degree is 4,550, vs 169 for Cora.
+
+| `--norm` | Per-seed q_test (%) | Mean q_test | Max AU psum L0 / L1 (mean) |
+|---|---|---|---|
+| FP32 model | 62.5 / 61.9 / 58.1 | 60.85 ± 2.40 | — |
+| fp32 (ideal Ã) | 56.6 / 58.3 / 48.8 | 54.56 ± 5.05 | n/a |
+| **fold** | **61.2 / 61.9 / 44.5** | **55.87 ± 9.87** | 6,756 / 5,354 |
+| per_source f=4 | 39.8 / 38.5 / 37.3 | 38.53 ± 1.29 | 29,897 / 6,817 |
+
+- **per_source f=4 fails on NELL.** Q1.4 rounds w = d^(−1/2) to 0 for degree > 1,024. On NELL
+  that is 21 hub nodes, which source 38,125 of 317,305 edges (12%), so their messages vanish.
+  At f=6 no w rounds to 0 (max relative error 33%). But w_int is 4× larger, so the L0 partial
+  sum, already 29,897 at f=4, would exceed the signed 16-bit limit (32,767). This is an
+  estimate (4 × 29,897 ≈ 120k); f=6 was not run. So no f satisfies both precision and the
+  16-bit accumulator on NELL.
+- **fold ≥ ideal Ã on average** (55.87 vs 54.56), and better on 2 of 3 seeds. An
+  interpretation, not tested: with unscaled B, hub rows set the per-column γ, and the
+  1/√d fold shrinks them so γ fits typical rows.
+- **Seed 2 is unstable in every mode.** PTQ (before QAT) drops to 21–39%, and QAT recovers
+  only part of it. NELL QAT is affected by the same open problem as CiteSeer and PubMed:
+  QAT losses even at λ = 0.
+- Per-seed time: about 22 minutes with 3 jobs in parallel on 4 CPUs.
+
 ## Known limitations / next steps
 
 - **b convergence:** Adam moves b by about `--lr-bits` per step, so 200 epochs allow about 2 bits
