@@ -91,7 +91,7 @@ class QGCN(nn.Module):
     """
 
     def __init__(self, dims: list[int], max_degree: int, norm: str = "fp32",
-                 frac_bits: int = 8, dropout: float = 0.5):
+                 frac_bits: int = 8, dropout: float = 0.5, x_param: str = "range"):
         super().__init__()
         assert norm in NORM_MODES, norm
         self.dims, self.norm, self.frac_bits, self.dropout = dims, norm, frac_bits, dropout
@@ -99,7 +99,7 @@ class QGCN(nn.Module):
         L = len(dims) - 1
         self.weights = nn.ParameterList(
             [nn.Parameter(nn.init.xavier_uniform_(torch.empty(dims[l], dims[l + 1]))) for l in range(L)])
-        self.x_quant = nn.ModuleList([DegreeAwareQuantizer(max_degree) for _ in range(L)])
+        self.x_quant = nn.ModuleList([DegreeAwareQuantizer(max_degree, x_param) for _ in range(L)])
         self.w_quant = nn.ModuleList([ColumnQuantizer(dims[l + 1]) for l in range(L)])
         self.b_quant = nn.ModuleList([ColumnQuantizer(dims[l + 1]) for l in range(L)])
 
@@ -111,8 +111,8 @@ class QGCN(nn.Module):
         return [p for m in (*self.x_quant, *self.w_quant, *self.b_quant) for p in m.parameters()]
 
     def alpha_params(self):
-        """log α tables of the degree-aware quantizers."""
-        return [q.log_scale for q in self.x_quant]
+        """log α (or log clip range) tables of the degree-aware quantizers."""
+        return [q.log_p for q in self.x_quant]
 
     def bit_params(self):
         """continuous b tables of the degree-aware quantizers."""

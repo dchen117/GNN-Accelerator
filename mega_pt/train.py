@@ -9,7 +9,7 @@ Pipeline per seed (Q-14):
 
 Examples
   python -m mega_pt.train --dataset cora --norm fp32 --seeds 1 --lam 0          # smoke test
-  python -m mega_pt.train --dataset cora --norm fold --lam 1e-4 --target-dense-bits 2.0
+  python -m mega_pt.train --dataset cora --norm fold --lam 1e-4 --target-layer-bits 2,2.6
   python -m mega_pt.train --dataset cora --norm per_source --frac-bits 6 --lam 1e-4 --m-target-kb 1000
 
 Results go to runs/<run-name>/results.json (per-seed metrics, mean/std summary, args) and
@@ -39,6 +39,9 @@ def parse_args(argv=None):
                    help="input preprocessing. 'none' (raw binary/TF-IDF) is the default: row "
                         "normalization makes layer-0 values tiny, many round to 0, QAT lost ~3 pts on Cora")
     p.add_argument("--norm", default="fp32", choices=NORM_MODES, help="aggregation normalization mode (Q-11)")
+    p.add_argument("--x-param", default="range", choices=["range", "alpha"],
+                   help="how the degree tables learn the scale: clip range c with α = c/q_max(b) "
+                        "(default), or α directly. Same forward pass/hardware; see quant.py")
     p.add_argument("--frac-bits", type=int, default=8, help="f in Q1.f for per_source mode")
     p.add_argument("--hidden", type=int, default=128, help="Tab.III: 128 for GCN")
     p.add_argument("--dropout", type=float, default=0.5)
@@ -48,7 +51,7 @@ def parse_args(argv=None):
     #   α at 1e-2 drifts upward and the training loss RISES (STE bias on values that round
     #   to 0), costing up to 25 pts; 1e-3 is stable.
     p.add_argument("--lr-qat-weights", type=float, default=1e-3, help="weights during QAT")
-    p.add_argument("--lr-alpha", type=float, default=1e-3, help="log α degree tables")
+    p.add_argument("--lr-alpha", type=float, default=1e-3, help="log α / log c degree tables")
     p.add_argument("--lr-bits", type=float, default=1e-2, help="b degree tables (bits per step ≈ lr)")
     p.add_argument("--lr-colscale", type=float, default=1e-2, help="log β / log γ column scales")
     p.add_argument("--wd", type=float, default=5e-4, help="weight decay on weights only")
@@ -59,6 +62,10 @@ def parse_args(argv=None):
     g.add_argument("--m-target-kb", type=float, help="M_target in KB (Eq.(4), dense)")
     g.add_argument("--target-dense-bits", type=float,
                    help="set M_target = N·Σ_l dim_l·bits/η, i.e. the dense memory at this mean bitwidth")
+    g.add_argument("--target-layer-bits", type=str,
+                   help="comma list, one mean bitwidth per quantized layer input, e.g. '2,2.6': "
+                        "M_target = N·Σ_l dim_l·bits_l/η. Preferred: it makes the target reachable "
+                        "(b >= 2), so with a large λ the penalty acts as a memory constraint")
     p.add_argument("--seeds", type=int, default=10, help="number of seeds 0..k-1 (Q-14: 10)")
     p.add_argument("--fp32-only", action="store_true", help="stop after FP32 pretraining")
     p.add_argument("--log-every", type=int, default=50)
@@ -129,7 +136,11 @@ def main(argv=None):
     dims = [g.num_features, args.hidden, g.num_classes]
 
     # M_target (KB). Eq.(4) counts dense storage over each layer input (Q-10, Q-13).
-    if args.target_dense_bits is not None:
+    if args.target_layer_bits is not None:
+        lb = [float(v) for v in args.target_layer_bits.split(",")]
+        assert len(lb) == len(dims) - 1, f"need {len(dims) - 1} values, got {lb}"
+        m_target = g.num_nodes * sum(d * b for d, b in zip(dims[:-1], lb)) / ETA
+    elif args.target_dense_bits is not None:
         m_target = g.num_nodes * sum(dims[:-1]) * args.target_dense_bits / ETA
     else:
         m_target = args.m_target_kb if args.m_target_kb is not None else 0.0
@@ -146,7 +157,8 @@ def main(argv=None):
     for seed in range(args.seeds):
         t0 = time.time()
         torch.manual_seed(seed)
-        model = QGCN(dims, int(g.deg.max()), norm=args.norm, frac_bits=args.frac_bits, dropout=args.dropout)
+        model = QGCN(dims, int(g.deg.max()), norm=args.norm, frac_bits=args.frac_bits, dropout=args.dropout,
+                     x_param=args.x_param)
         fp32_test, fp32_val = train_fp32(model, g, ops, args)
         row = {"seed": seed, "fp32_test": fp32_test, "fp32_val": fp32_val}
         if not args.fp32_only:

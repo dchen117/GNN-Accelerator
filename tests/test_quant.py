@@ -142,6 +142,21 @@ def test_sparse_input_matches_dense():
         logits, recs = m(x, ops, record=True)
         logits.sum().backward()
         outs.append((logits.detach(), recs[0]["nnz_per_node"],
-                     m.weights[0].grad, m.x_quant[0].log_scale.grad, m.x_quant[0].bits.grad))
+                     m.weights[0].grad, m.x_quant[0].log_p.grad, m.x_quant[0].bits.grad))
     for a, b in zip(*outs):
         assert torch.allclose(a, b, atol=1e-5), (a, b)
+
+
+def test_range_param_keeps_clip_range_when_bits_drop():
+    """x_param="range": α = c / q_max(round(b)), so lowering b keeps the largest
+    representable value at c. "alpha" mode keeps α instead, so the range shrinks."""
+    x = torch.tensor([[1.0, 0.0, 1.0]])
+    deg = torch.tensor([1])
+    for param, expect_max in (("range", 1.0), ("alpha", 1.0 / 7)):
+        q = DegreeAwareQuantizer(max_degree=1, param=param)
+        q.init_from_activations(x, deg)                      # b = 4: α = 1/7 in both modes
+        assert torch.allclose(q.scale[1], torch.tensor(1.0 / 7))
+        with torch.no_grad():
+            q.bits.fill_(2.0)                                 # q_max = 1
+        xq, _ = q(x, deg)
+        assert torch.allclose(xq.max(), torch.tensor(expect_max)), param

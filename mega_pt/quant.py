@@ -10,7 +10,8 @@ Decisions implemented here (docs/mega-kb/04-open-questions.md):
   Q-03  one table per quantized layer input (each layer builds its own DegreeAwareQuantizer).
   Q-04  b continuous, clamped to [B_MIN, B_MAX]; forward uses round(b), backward is STE.
   Q-05  STE for rounding; α gets the LSQ-equivalent gradient from autograd, no grad scaling.
-        Scales are learned as log α (implementation choice; see DegreeAwareQuantizer).
+        Scales are learned in log space, by default as a clip range c with α = c/q_max(b)
+        (implementation choices; see DegreeAwareQuantizer).
   Q-06  signed everywhere (X, W, B).
   Q-07  feature bitwidth range 2..8.
   Q-08  W: fixed 4 bit, per-column scale β.
@@ -67,31 +68,54 @@ def eq2_quantize(x: torch.Tensor, alpha: torch.Tensor, qmax: torch.Tensor):
 class DegreeAwareQuantizer(nn.Module):
     """Per-node quantizer whose (α, b) are looked up by node degree. Eq.(2), Q-02/Q-03/Q-04.
 
-    Parameters
-      log_scale[d] : log α for nodes of degree d   (shape d_max+1); α = exp(log_scale)
-      bits[d]      : continuous bitwidth b         (shape d_max+1), clamped to [B_MIN, B_MAX]
+    Parameters (one entry per degree d = 0..d_max)
+      log_p[d] : log of the learned scale parameter, see `param` below
+      bits[d]  : continuous bitwidth b, clamped to [B_MIN, B_MAX]
 
-    Why log α: Adam's step size is roughly lr in absolute terms. α is often ~0.01, so a
-    linear α with lr 0.01 changes by ~100% per step and training diverged in our first
-    test. In log space the same lr is a ~1% relative change. Implementation choice, not
-    from the paper; it changes α's gradient by a factor α but not the forward pass.
+    param = "range" (default): log_p = log c_d, the clipping range, and
+                α_d = c_d / (2^(round(b_d)−1) − 1).
+            "alpha": log_p = log α_d directly (our first version).
+    Both give exactly Eq.(2) in the forward pass, and the hardware stores the same thing (one
+    α per degree, computed from c and b after training). They differ only in what gradient
+    descent sees. With "alpha", lowering b at fixed α shrinks the clip range 2× per bit: on
+    Cora's binary features, b 4->2 at α = 1/7 maps every 1 to 1/7, so the task loss resists
+    any bit reduction on layer 0 (where 2 bits would be lossless) and the memory penalty
+    squeezes the hidden layer instead. With "range", lowering b keeps the range and only
+    coarsens the grid. Measured comparison in mega_pt/README.md. Implementation choice,
+    not from the paper (the paper learns "s" and b, Eq.(2), and does not say how).
+
+    Why log space: Adam's step is ~lr in absolute terms. α is often ~0.01, so a linear α
+    with lr 0.01 changes ~100% per step and training diverged in our first test. In log
+    space the same lr is a ~1% relative change.
 
     Degree 0 has an entry like any other (Q-02). With self-loops counted (Q-01) it is never
-    used for the citation graphs, so it just keeps its initial value.
+    used, so it just keeps its initial value.
     """
 
-    def __init__(self, max_degree: int):
+    def __init__(self, max_degree: int, param: str = "range"):
         super().__init__()
-        self.log_scale = nn.Parameter(torch.zeros(max_degree + 1))
+        assert param in ("range", "alpha"), param
+        self.param = param
+        self.log_p = nn.Parameter(torch.zeros(max_degree + 1))
         self.bits = nn.Parameter(torch.full((max_degree + 1,), B_INIT))
+
+    def alpha_table(self) -> torch.Tensor:
+        """α per degree (shape d_max+1), differentiable w.r.t. log_p and (in "range" mode,
+        through the STE-rounded q_max) w.r.t. b."""
+        if self.param == "alpha":
+            return self.log_p.exp()
+        b = round_half_away_ste(self.bits.clamp(B_MIN, B_MAX))
+        return self.log_p.exp() / qmax_from_bits(b)
 
     @property
     def scale(self) -> torch.Tensor:
-        return self.log_scale.exp()
+        """α per degree (what the hardware would store)."""
+        return self.alpha_table()
 
     @torch.no_grad()
     def init_from_activations(self, x: torch.Tensor, deg: torch.Tensor) -> None:
         """Q-04 init: α_d = max|x| over nodes of degree d / Q_max(B_INIT); b = B_INIT.
+        (In "range" mode: c_d = max|x|, which gives the same α at b = B_INIT.)
 
         Degrees with no nodes get the layer-wide max. Max-based init means nothing is
         clipped at the start; the losses then push α and b down.
@@ -104,11 +128,11 @@ class DegreeAwareQuantizer(nn.Module):
         else:
             row_max = x.abs().amax(dim=1)                   # (N,)
         global_max = row_max.max().clamp_min(EPS)
-        per_deg = torch.zeros_like(self.log_scale)
+        per_deg = torch.zeros_like(self.log_p)
         per_deg.scatter_reduce_(0, deg, row_max, reduce="amax", include_self=True)
         present = torch.bincount(deg, minlength=per_deg.numel()) > 0
         per_deg = torch.where(present & (per_deg > 0), per_deg, global_max)
-        self.log_scale.copy_((per_deg / qmax).log())
+        self.log_p.copy_((per_deg / qmax).log() if self.param == "alpha" else per_deg.log())
         self.bits.fill_(B_INIT)
 
     @torch.no_grad()
@@ -130,13 +154,13 @@ class DegreeAwareQuantizer(nn.Module):
             x = x.coalesce()
             idx = x.indices()
             d = deg[idx[0]]                                           # degree of each nnz's row
-            alpha = self.scale[d]
+            alpha = self.alpha_table()[d]
             qmax = qmax_from_bits(self.node_bits(d, rounded=True))
             xq, xbar = eq2_quantize(x.values(), alpha, qmax)
             # check_invariants=False: idx comes from an already-coalesced, validated tensor.
             return (torch.sparse_coo_tensor(idx, xq, x.shape, is_coalesced=True, check_invariants=False),
                     torch.sparse_coo_tensor(idx, xbar, x.shape, is_coalesced=True, check_invariants=False))
-        alpha = self.scale[deg].unsqueeze(1)                          # (N, 1)
+        alpha = self.alpha_table()[deg].unsqueeze(1)                  # (N, 1)
         qmax = qmax_from_bits(self.node_bits(deg, rounded=True)).unsqueeze(1)
         return eq2_quantize(x, alpha, qmax)
 
