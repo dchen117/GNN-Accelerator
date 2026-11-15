@@ -1,6 +1,6 @@
 # 04 — Open Questions, Gaps, and Inconsistencies
 
-**Status (2026-11-15):** Q-01–Q-15 have decisions (Q-11 decided as fold on Cora + NELL; Reddit pending). Q-16 onward are
+**Status (2026-11-15):** Q-01–Q-15 have decisions (Q-11 decided as fold on Cora + NELL; Reddit pending). GCN matches Tab.VI on Cora, CiteSeer and PubMed (Q-04 amended: MSE clip init + re-fit). Q-16 onward are
 open. The PyTorch model implementing them is in `mega_pt/`.
 
 Each entry lists what the paper says (with citations), what is missing or conflicting, and
@@ -77,6 +77,20 @@ The paper is never "corrected" here. Possible readings are listed but not chosen
       `mega_pt/README.md`. The old behaviour is kept as `--x-param alpha`.
     - Trade-off: none in hardware. In optimization, b's gradient now also flows through α for
       unclipped values, so the note above (task loss reaches b only via clipping) no longer holds.
+  - **Amended again 2026-11-15** (implementation, not a change to the decision): the clip range is
+    **initialized by MSE and re-fit by MSE during QAT instead of learned by gradient.**
+    - Init: c_d is the fraction of the per-degree max (grid 0.05…1.0) that minimizes
+      Σ(x − Q(x))² over the nodes of degree d at b = 4. Replaces c_d = max|x|.
+    - QAT: every 10 epochs (and after the last one) every c_d is re-fit the same way at that
+      degree's current round(b), on the current layer input. b is still learned (Eq.(5)).
+    - Why: max-based init rounds most heavy-tailed inputs to 0 (PubMed PTQ 73.4 → 79.5 with MSE
+      init; FP32 79.1). And with 60–140 training nodes the learned range gets almost no useful
+      gradient, drifts upward, and can't follow b when the penalty lowers it, so CiteSeer and
+      PubMed collapsed at λ = 1e-7 (57%). With re-fit: PubMed 78.2 at 0.89 bits, CiteSeer 70.3 at
+      1.32 bits (3 seeds); both match Tab.VI. Details in `mega_pt/README.md`.
+    - Trade-off: none in hardware (one α per degree either way). In optimization, c is no longer
+      trained for the task loss directly; it minimizes reconstruction error, which is a proxy.
+      Old behaviour: `--x-init max --clip-refit 0`.
 
 ### Q-05 — Gradient through rounding `[PT]` blocking
 - Says: Eq.(2) uses ⌊|x|/α + 0.5⌋ (p.5).
@@ -235,8 +249,11 @@ The paper is never "corrected" here. Possible readings are listed but not chosen
       at 1.70). The useful λ range is much lower than the scale note above suggested: 1e-5
       already costs 4 points. Adam turns any persistent penalty gradient into a ~lr step per
       epoch, so λ mostly sets *when* the task gradient wins, not how hard the penalty pulls.
-    - **Open: CiteSeer and PubMed** lose about 3 points even at λ = 0, and collapse at
-      λ = 1e-7. The ablation points at the degree-aware X quantizer. Not resolved.
+    - **CiteSeer and PubMed** lost about 3 points even at λ = 0 and collapsed at λ = 1e-7; the
+      ablation pointed at the degree-aware X quantizer. **Resolved 2026-11-15** by the Q-04
+      MSE clip init + re-fit: λ = 1e-7 now matches Tab.VI on all three (10-seed numbers in
+      `mega_pt/README.md`). The same λ = 1e-7 works for every dataset, so per-dataset tuning was
+      not needed.
 
 ### Q-14 — Training setup `[PT]` blocking
 - Says: Fig.3 averages over 100 runs (p.3). Tab.VI reports mean ± std (p.10). Training on one
@@ -255,7 +272,10 @@ The paper is never "corrected" here. Possible readings are listed but not chosen
     features instead of row normalization (row normalization made many layer-0 values round to 0;
     QAT 75.9 vs 79.7 on Cora). QAT uses lr 1e-3 for weights and for log α, 1e-2 for b and for
     log β/γ (α at 1e-2 drifted up and the training loss rose). Scales are learned in log space.
-  - **Caveat 2026-11-15:** the raw-feature choice was measured on Cora only, and before the
+  - **Amended 2026-11-15: back to row normalization for every dataset.** With the Q-04 MSE clip
+    init + re-fit, row normalization no longer hurts Cora (λ = 1e-7: row 81.77 vs raw 81.00,
+    3 seeds) and is needed on CiteSeer (below). One preprocessing for all datasets.
+  - **Caveat 2026-11-15 (superseded by the amendment above):** the raw-feature choice was measured on Cora only, and before the
     Q-04 clip-range fix. FP32 on CiteSeer is 68.8 (raw) vs 71.4 (row-normalized; Tab.VI 71.1),
     so the choice should be revisited per dataset. NELL needs row normalization plus
     dropout 0.1, wd 1e-5 and 400 FP32 epochs to reach 62.5% FP32 (raw counts with our default

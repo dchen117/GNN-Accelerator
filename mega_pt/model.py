@@ -35,7 +35,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .data import Graph
-from .quant import ColumnQuantizer, DegreeAwareQuantizer, fixed_point_q1
+from .quant import B_INIT, ColumnQuantizer, DegreeAwareQuantizer, fixed_point_q1
 
 NORM_MODES = ("fp32", "fold", "per_source")
 
@@ -186,13 +186,16 @@ class QGCN(nn.Module):
             rec["psum"] = psum().detach() if psum is not None else None
         return H
 
-    def forward(self, x: torch.Tensor, ops: GraphOps, record: bool = False):
-        """Returns logits, plus a list of per-layer records when record=True."""
+    def forward(self, x: torch.Tensor, ops: GraphOps, record: bool = False, refit: bool = False):
+        """Returns logits, plus a list of per-layer records when record=True.
+        refit=True: re-fit each layer's clip ranges on its actual input first (refit_clips_)."""
         records = []
         L = len(self.weights)
         for l in range(L):
             rec = {} if record else None
             if self.quantize:
+                if refit:
+                    self.x_quant[l].refit_clip_(x, ops.deg)
                 xq, xbar = self.x_quant[l](x, ops.deg)
                 x = xq if "x" in self.quant_parts else x
                 Wq, _ = self.w_quant[l](self.weights[l])
@@ -215,21 +218,36 @@ class QGCN(nn.Module):
                 records.append(rec)
         return (x, records) if record else x
 
+    @torch.no_grad()
+    def refit_clips_(self, x: torch.Tensor, ops: GraphOps) -> None:
+        """MSE re-fit of every degree-aware clip range at the current rounded b (train.py
+        --clip-refit). Runs one quantized eval pass, layer by layer, so layer l's range is fit
+        on the input that the (already re-fit) quantized layers before it produce."""
+        was_training = self.training
+        self.eval()
+        self(x, ops, refit=True)
+        self.train(was_training)
+
     # ------------------------------------------------------------------ init
     @torch.no_grad()
-    def calibrate(self, x: torch.Tensor, ops: GraphOps) -> None:
+    def calibrate(self, x: torch.Tensor, ops: GraphOps, x_init: str = "max",
+                  init_bits: list[float] | None = None) -> None:
         """Initialize all scales from one FP32 eval pass (Q-04, Q-08, Q-09).
 
         Runs the FP32 network layer by layer and initializes, per layer:
           α table from the layer input X (per degree), β from W, γ from B as the
           selected norm mode will see it (fold quantizes D^-1/2 B, not B).
+        x_init: "max" or "mse" clip-range init for the α tables (see
+          DegreeAwareQuantizer.init_from_activations).
+        init_bits: starting bitwidth per layer (all degrees); default B_INIT everywhere.
         """
         was_training, was_quant = self.training, self.quantize
         self.eval()
         self.quantize = False
         L = len(self.weights)
         for l in range(L):
-            self.x_quant[l].init_from_activations(x, ops.deg)
+            self.x_quant[l].init_from_activations(x, ops.deg, x_init,
+                                                 bits=init_bits[l] if init_bits else B_INIT)
             self.w_quant[l].init_from_tensor(self.weights[l])
             B = _matmul(x, self.weights[l])
             B_seen = ops.dinv_sqrt.unsqueeze(1) * B if self.norm == "fold" else B

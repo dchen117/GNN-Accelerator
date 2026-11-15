@@ -30,6 +30,8 @@ B_MIN, B_MAX = 2.0, 8.0   # Q-07: feature bitwidth range
 B_INIT = 4.0              # Q-04: initial bitwidth
 W_BITS = 4                # Q-08 / Q-09: weights and B are fixed 4 bit
 EPS = 1e-8                # floor for scales so |x|/α never divides by zero
+# clip-range candidates for the "mse" init, as fractions of the max (0.05 .. 1.0)
+R_GRID = [i / 40 for i in range(2, 41)]
 
 
 def round_half_away_ste(v: torch.Tensor) -> torch.Tensor:
@@ -63,6 +65,43 @@ def eq2_quantize(x: torch.Tensor, alpha: torch.Tensor, qmax: torch.Tensor):
     level = torch.minimum(level, qmax)
     x_bar = torch.sign(x) * level
     return x_bar * alpha, x_bar.detach()
+
+
+@torch.no_grad()
+def _nonzero_abs(x: torch.Tensor):
+    """(row index, |value|) of every non-zero entry of a dense or sparse COO x. Zeros are
+    dropped: they quantize exactly under Eq.(2) whatever the scale, so they never affect the
+    max or the MSE (and PubMed's TF-IDF X^(0) is ~90% zeros, so this is much faster)."""
+    if x.is_sparse:
+        x = x.coalesce()
+        rows, vals = x.indices()[0], x.values().abs()
+        keep = vals > 0
+        return rows[keep], vals[keep]
+    rows, cols = x.nonzero(as_tuple=True)
+    return rows, x[rows, cols].abs()
+
+
+@torch.no_grad()
+def _mse_clip(rows, vals, deg, per_deg_max, qmax_per_deg):
+    """Per degree d, the clip range c_d = r·max_d (r from R_GRID) minimizing Σ (|x| − Q(|x|))²
+    over the values of the nodes with degree d, at q_max = qmax_per_deg[d].
+
+    rows/vals: node index and |value| of each non-zero input entry (_nonzero_abs). Quantizing |x| gives the same error as x (Eq.(2) is
+    symmetric). Returns c (shape d_max+1). Cost: len(R_GRID) passes over the values.
+    """
+    n_deg = per_deg_max.numel()
+    vdeg = deg[rows]                                   # degree of each value's node
+    vmax, vq = per_deg_max[vdeg], qmax_per_deg[vdeg]
+    best_err = torch.full((n_deg,), float("inf"), dtype=vals.dtype)
+    best_r = torch.ones(n_deg, dtype=vals.dtype)
+    for r in R_GRID:
+        alpha = r * vmax / vq
+        q = torch.minimum(torch.floor(vals / alpha + 0.5), vq) * alpha
+        err = torch.zeros(n_deg, dtype=vals.dtype).index_add_(0, vdeg, (vals - q) ** 2)
+        better = err < best_err
+        best_err = torch.where(better, err, best_err)
+        best_r = torch.where(better, torch.full_like(best_r, r), best_r)
+    return best_r * per_deg_max
 
 
 class DegreeAwareQuantizer(nn.Module):
@@ -113,27 +152,61 @@ class DegreeAwareQuantizer(nn.Module):
         return self.alpha_table()
 
     @torch.no_grad()
-    def init_from_activations(self, x: torch.Tensor, deg: torch.Tensor) -> None:
-        """Q-04 init: α_d = max|x| over nodes of degree d / Q_max(B_INIT); b = B_INIT.
-        (In "range" mode: c_d = max|x|, which gives the same α at b = B_INIT.)
+    def init_from_activations(self, x: torch.Tensor, deg: torch.Tensor, method: str = "max",
+                              bits: float = B_INIT) -> None:
+        """Q-04 init of the per-degree clip range c_d (α_d = c_d / Q_max(B_INIT)); b = B_INIT.
 
-        Degrees with no nodes get the layer-wide max. Max-based init means nothing is
-        clipped at the start; the losses then push α and b down.
+        method = "max": c_d = max|x| over the nodes of degree d. Nothing is clipped at the
+                 start; the losses then push α and b down. Our first version.
+        method = "mse": c_d = r_d · max_d, with r_d picked from a grid (R_GRID) to minimize
+                 Σ (x − Q(x))² over the nodes of degree d at b = B_INIT. Clips a few outliers
+                 so the many small values get a finer grid instead of rounding to 0.
+        Why "mse" exists: on heavy-tailed inputs (PubMed/CiteSeer TF-IDF, hidden ReLU
+        outputs) max-based α = max/7 rounds most entries to 0, and QAT cannot recover it --
+        with 60-120 training nodes the task loss is ~0.05 within 50 epochs, so the clip range
+        gets almost no gradient. Measured comparison in mega_pt/README.md. Both are
+        implementation choices; the paper does not say how α is initialized.
+
+        Degrees with no nodes get the layer-wide value (never used, Q-02).
+        bits: bitwidth to initialize b to and to fit the "mse" clip range for (default B_INIT).
         """
-        qmax = qmax_from_bits(torch.tensor(B_INIT)).item()
-        if x.is_sparse:   # NELL's X^(0): max over each row's stored non-zeros
-            x = x.coalesce()
-            row_max = torch.zeros(deg.numel(), dtype=x.dtype)
-            row_max.scatter_reduce_(0, x.indices()[0], x.values().abs(), reduce="amax")
-        else:
-            row_max = x.abs().amax(dim=1)                   # (N,)
-        global_max = row_max.max().clamp_min(EPS)
-        per_deg = torch.zeros_like(self.log_p)
-        per_deg.scatter_reduce_(0, deg, row_max, reduce="amax", include_self=True)
-        present = torch.bincount(deg, minlength=per_deg.numel()) > 0
+        assert method in ("max", "mse"), method
+        qmax = qmax_from_bits(torch.tensor(float(bits))).item()
+        rows, vals = _nonzero_abs(x)
+        n_deg = self.log_p.numel()
+        node_max = torch.zeros(deg.numel(), dtype=vals.dtype).scatter_reduce_(0, rows, vals, reduce="amax")
+        per_deg = torch.zeros(n_deg, dtype=vals.dtype).scatter_reduce_(0, deg, node_max, reduce="amax")
+        global_max = node_max.max().clamp_min(EPS)
+        present = torch.bincount(deg, minlength=n_deg) > 0
         per_deg = torch.where(present & (per_deg > 0), per_deg, global_max)
+
+        if method == "mse":
+            per_deg = _mse_clip(rows, vals, deg, per_deg, torch.full_like(per_deg, qmax))
         self.log_p.copy_((per_deg / qmax).log() if self.param == "alpha" else per_deg.log())
-        self.bits.fill_(B_INIT)
+        self.bits.fill_(bits)
+
+    @torch.no_grad()
+    def refit_clip_(self, x: torch.Tensor, deg: torch.Tensor) -> None:
+        """Re-fit every degree's clip range by MSE at its CURRENT rounded bitwidth, on the
+        current layer input x (train.py --clip-refit K calls this every K QAT epochs).
+
+        Why: with the clip range learned by gradient, QAT on 60-140 training nodes drifts it
+        (it grows, more inputs round to 0) and it cannot follow b when the memory penalty
+        lowers b (the MSE-best range at 2 bits is far smaller than at 4). Re-fitting makes c
+        a deterministic function of (data, round(b)). b is still learned (Eq.(5)); only how c
+        is chosen changes. Hardware unaffected: it stores one α per degree either way.
+        Measured in mega_pt/README.md. Implementation choice, not from the paper.
+        """
+        rows, vals = _nonzero_abs(x)
+        n_deg = self.log_p.numel()
+        node_max = torch.zeros(deg.numel(), dtype=vals.dtype).scatter_reduce_(0, rows, vals, reduce="amax")
+        per_deg = torch.zeros(n_deg, dtype=vals.dtype).scatter_reduce_(0, deg, node_max, reduce="amax")
+        present = torch.bincount(deg, minlength=n_deg) > 0
+        use = present & (per_deg > 0)              # degrees with no nodes / all-zero inputs: keep
+        qmax = qmax_from_bits(round_half_away_ste(self.bits.clamp(B_MIN, B_MAX)))
+        c = _mse_clip(rows, vals, deg, per_deg.clamp_min(EPS), qmax)
+        new = (c / qmax).log() if self.param == "alpha" else c.log()
+        self.log_p.copy_(torch.where(use, new, self.log_p))
 
     @torch.no_grad()
     def clamp_(self) -> None:

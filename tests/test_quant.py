@@ -160,3 +160,45 @@ def test_range_param_keeps_clip_range_when_bits_drop():
             q.bits.fill_(2.0)                                 # q_max = 1
         xq, _ = q(x, deg)
         assert torch.allclose(xq.max(), torch.tensor(expect_max)), param
+
+
+def _mse(q, x, deg):
+    xq, _ = q(x, deg)
+    return ((x - xq) ** 2).sum().item()
+
+
+def test_mse_init_beats_max_on_heavy_tailed_input():
+    """Q-04 amendment: --x-init mse clips a few outliers so most values get a finer grid.
+    On a heavy-tailed input its quantization error must be below max-based init's."""
+    torch.manual_seed(0)
+    x = torch.distributions.Exponential(1.0).sample((200, 16)) ** 2   # heavy tail
+    deg = torch.randint(1, 4, (200,))
+    errs = {}
+    for method in ("max", "mse"):
+        q = DegreeAwareQuantizer(max_degree=3)
+        q.init_from_activations(x, deg, method)
+        errs[method] = _mse(q, x, deg)
+    assert errs["mse"] < 0.8 * errs["max"], errs
+
+
+def test_refit_clip_follows_bitwidth_and_keeps_sparse_dense_equal():
+    """refit_clip_ (--clip-refit): after b drops 4 -> 2, re-fitting the range at the new b must
+    lower the error vs keeping the 4-bit range, give the range picked by an MSE init done
+    directly at 2 bits, and treat a sparse input exactly like its dense copy."""
+    torch.manual_seed(1)
+    x = torch.relu(torch.randn(300, 8)) ** 2
+    deg = torch.randint(1, 5, (300,))
+    q = DegreeAwareQuantizer(max_degree=4)
+    q.init_from_activations(x, deg, "mse")             # fit for b = 4
+    with torch.no_grad():
+        q.bits.fill_(2.0)
+    stale = _mse(q, x, deg)
+    q.refit_clip_(x, deg)
+    assert _mse(q, x, deg) < stale
+    direct = DegreeAwareQuantizer(max_degree=4)
+    direct.init_from_activations(x, deg, "mse", bits=2)
+    assert torch.allclose(q.log_p, direct.log_p)
+    qs = DegreeAwareQuantizer(max_degree=4)
+    qs.load_state_dict(q.state_dict())
+    qs.refit_clip_(x.to_sparse(), deg)
+    assert torch.allclose(qs.log_p, q.log_p)
