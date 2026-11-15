@@ -52,8 +52,18 @@ def _dropout(x: torch.Tensor, p: float, training: bool) -> torch.Tensor:
 
 
 def _matmul(x: torch.Tensor, W: torch.Tensor) -> torch.Tensor:
-    """X W for dense or sparse COO X (the Combination step, Eq.(3))."""
-    return torch.sparse.mm(x, W) if x.is_sparse else x @ W
+    """X W for dense or sparse COO X (the Combination step, Eq.(3)).
+
+    Sparse X is done as gather + scatter-add over the non-zeros instead of torch.sparse.mm:
+    when X's values need a gradient (QAT: they depend on α and b), sparse.mm's backward
+    materializes a dense N x F gradient -- 16 GB for NELL, which got the process OOM-killed.
+    Here autograd memory is O(nnz x hidden) (~220 MB for NELL)."""
+    if not x.is_sparse:
+        return x @ W
+    x = x.coalesce()
+    row, col = x.indices()
+    contrib = x.values().unsqueeze(1) * W[col]                 # (nnz, out)
+    return torch.zeros(x.shape[0], W.shape[1], dtype=W.dtype).index_add(0, row, contrib)
 
 
 def _nnz_per_node(xbar: torch.Tensor, n: int) -> torch.Tensor:
