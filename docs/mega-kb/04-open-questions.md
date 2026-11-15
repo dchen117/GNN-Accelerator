@@ -66,6 +66,17 @@ The paper is never "corrected" here. Possible readings are listed but not chosen
     clipping, so b and α are only pushed down by the losses.
   - Note [DERIVED]: under Eq.(2) the task loss reaches b only through clipped values (b sets the
     clip level); the memory penalty is what pushes b down.
+  - **Amended 2026-11-15** (implementation of the decision, not a change to it): the degree tables
+    learn a clip range c_d, with α_d = c_d / (2^(round(b_d)−1) − 1), instead of learning α_d
+    directly. The initialization is the same (c_d = max|x|, so α_d = max|x|/7 at b = 4). The
+    forward pass is still exactly Eq.(2), and the hardware still stores one α per degree.
+    - Why: with α learned directly, lowering b shrinks the clip range 2× per bit. On Cora's binary
+      features, b 4→2 maps every 1 to 1/7. The task loss then blocked bit reduction on layer 0,
+      where 2 bits are lossless, and the penalty crushed the hidden layer instead. After the
+      change, the Cora λ sweep matches Tab.VI (81.0 ± 1.1 at 1.60 bits). Numbers in
+      `mega_pt/README.md`. The old behaviour is kept as `--x-param alpha`.
+    - Trade-off: none in hardware. In optimization, b's gradient now also flows through α for
+      unclipped values, so the note above (task loss reaches b only via clipping) no longer holds.
 
 ### Q-05 — Gradient through rounding `[PT]` blocking
 - Says: Eq.(2) uses ⌊|x|/α + 0.5⌋ (p.5).
@@ -205,6 +216,17 @@ The paper is never "corrected" here. Possible readings are listed but not chosen
   - Trade-off: the penalty and the reported metric measure different things, so M_target can't
     be computed directly from Tab.VI; it needs a sweep. Scale note: Cora's dense memory is
     ≈ 516·b̄ KB, so a 50 KB miss costs 2500·λ; λ around 1e-5–1e-3 is the starting range.
+  - **Sweep result 2026-11-15** (`mega_pt/README.md`, results log):
+    - **How to set it.** Put M_target at the 2-bit dense floor (`--target-dense-bits 2.0`) and
+      use λ as the only knob. A "reachable" target with a large λ doesn't work as a constraint:
+      Eq.(4) uses continuous b, and layer 0's continuous b settles just under 2.5 (it rounds to 2)
+      with 11× the hidden layer's dimension, which uses up the hidden layer's budget.
+    - **Cora.** λ = 1e-7 gives 81.00 ± 1.14 at 1.60 sparse bits, which meets Tab.VI (80.9 ± 0.6
+      at 1.70). The useful λ range is much lower than the scale note above suggested: 1e-5
+      already costs 4 points. Adam turns any persistent penalty gradient into a ~lr step per
+      epoch, so λ mostly sets *when* the task gradient wins, not how hard the penalty pulls.
+    - **Open: CiteSeer and PubMed** lose about 3 points even at λ = 0, and collapse at
+      λ = 1e-7. The ablation points at the degree-aware X quantizer. Not resolved.
 
 ### Q-14 — Training setup `[PT]` blocking
 - Says: Fig.3 averages over 100 runs (p.3). Tab.VI reports mean ± std (p.10). Training on one
@@ -223,6 +245,11 @@ The paper is never "corrected" here. Possible readings are listed but not chosen
     features instead of row normalization (row normalization made many layer-0 values round to 0;
     QAT 75.9 vs 79.7 on Cora). QAT uses lr 1e-3 for weights and for log α, 1e-2 for b and for
     log β/γ (α at 1e-2 drifted up and the training loss rose). Scales are learned in log space.
+  - **Caveat 2026-11-15:** the raw-feature choice was measured on Cora only, and before the
+    Q-04 clip-range fix. FP32 on CiteSeer is 68.8 (raw) vs 71.4 (row-normalized; Tab.VI 71.1),
+    so the choice should be revisited per dataset. NELL needs row normalization plus
+    dropout 0.1, wd 1e-5 and 400 FP32 epochs to reach 62.5% FP32 (raw counts with our default
+    recipe: 57.2%; Kipf & Welling report 66.0%). Tab.VI has no NELL accuracy to compare with.
 
 ### Q-15 — Compression-ratio definition `[PT]` affects-fidelity
 - Says: "take the ratio of the average bitwidth / 32 as the theoretical compression ratio"

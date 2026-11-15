@@ -29,7 +29,7 @@ The datasets download automatically on first use to `data/planetoid/`, which is 
 ## Run
 
 Quick check that the data loads (edge counts should match Tab.II: Cora 10556, CiteSeer 9104,
-PubMed 88648):
+PubMed 88648, NELL 251550):
 
 ```bash
 .venv/bin/python -m mega_pt.data
@@ -41,10 +41,16 @@ Unit tests (each test names the equation or Q-ID it checks):
 .venv/bin/python -m pytest -q tests
 ```
 
-One configuration, 10 seeds:
+One configuration, 10 seeds (the Cora setting that matches Tab.VI):
 
 ```bash
-.venv/bin/python -m mega_pt.train --dataset cora --norm fold --lam 1e-5 --target-dense-bits 2.0
+.venv/bin/python -m mega_pt.train --dataset cora --norm fold --lam 1e-7 --target-dense-bits 2.0 --lr-bits 2e-2
+```
+
+Debug ablation, quantizing only some tensors (here: only the degree-aware features):
+
+```bash
+.venv/bin/python -m mega_pt.train --dataset pubmed --norm fold --lam 0 --seeds 3 --quant-parts x
 ```
 
 All options:
@@ -71,7 +77,7 @@ Outputs go to `runs/<name>/`:
 
 | File | Contents |
 |---|---|
-| `data.py` | Planetoid loader with a whitelist unpickler. Public split, self-loops, in-degree (Q-01, Q-14) |
+| `data.py` | Planetoid loader (Cora/CiteSeer/PubMed/NELL) with a whitelist unpickler. Public split, self-loops, in-degree (Q-01, Q-14). NELL's X^(0) is sparse |
 | `quant.py` | Eq.(2) quantizer with STE, the degree-indexed (α, b) table, 4-bit column quantizer, Q1.f fixed point |
 | `model.py` | `QGCN` and `GraphOps`. The three normalization modes (Q-11) are described in the module docstring |
 | `metrics.py` | Accuracy, average-bits definitions (Q-15), memory, partial-sum / lost-B checks |
@@ -124,13 +130,67 @@ FP32 for the same seeds: 81.50 ± 0.82. Tab.VI reports 81.5 ± 0.7 (FP32) and 80
 - **Caveat:** Cora's maximum degree is 169. The rule also requires NELL and Reddit, where
   high-degree nodes are common, before Q-11 is closed. Three seeds is a small sample.
 
+### 2026-11-15 — λ sweep (Q-13), all `--norm fold`, 3 seeds, `--lr-bits 2e-2`, 200 QAT epochs
+
+**Cora: matches Tab.VI.** M_target is at the 2-bit dense floor (`--target-dense-bits 2.0`), clip-range parameterization.
+
+| λ | q_test (%) | avg_bits_sparse | L1 mean b | L1 density |
+|---|---|---|---|---|
+| 0 | 80.83 ± 0.91 | 2.46 | 3.58 | 0.65 |
+| **1e-7** | **81.00 ± 1.14** | **1.60 (CR 20×)** | 2.95 | 0.53 |
+| 3e-7 | 80.73 ± 0.49 | 1.65 | 2.98 | 0.55 |
+| 1e-6 | 80.43 ± 0.55 | 1.62 | 2.95 | 0.54 |
+| 3e-6 | 80.33 ± 0.21 | 1.51 | 2.87 | 0.51 |
+| 1e-5 | 77.17 ± 0.38 | 0.44 | 2.15 | 0.18 |
+
+Tab.VI: 80.9 ± 0.6 at 1.70 bits, so λ = 1e-7 meets the acceptance check (accuracy within std, at
+≤ the reported bits). λ from 1e-7 to 3e-6 is a flat plateau; 1e-5 falls off a cliff. Layer 0 is
+at 2 bits in every run (lossless for binary features).
+
+Before the clip-range fix (`--x-param alpha`), the same sweep gave 78.4–79.6%. Each fix is
+documented in "Implementation choices" above.
+
+**CiteSeer and PubMed: not matched yet (open).** Both lose about 3 points to QAT *even with
+λ = 0*, and the memory penalty is far more sensitive than on Cora.
+
+| Dataset (FP32 ours / Tab.VI) | Setting | q_test (%) | avg_bits_sparse |
+|---|---|---|---|
+| CiteSeer raw (68.5 / 71.1) | λ = 0 | 67.37 ± 0.31 | 2.95 |
+| | λ = 1e-8 | 66.57 ± 1.14 | 2.09 |
+| | λ = 1e-7 | 65.97 ± 1.31 | 1.26 |
+| CiteSeer row-norm (71.1 / 71.1) | λ = 0 | 68.00 ± 1.90 | 1.52 |
+| | λ = 1e-7 | 22.87 (collapse) | 0.09 |
+| PubMed (79.1 / 78.9) | λ = 0 | 75.93 ± 0.31 | 2.00 |
+| | λ = 1e-8 | 63.57 ± 8.75 | 0.39 |
+| | λ = 1e-7 | 25.33 (collapse) | 0.02 |
+
+Diagnosis so far:
+- **Not the normalization.** PubMed with λ = 0: fold 75.93, ideal Ã 75.20, per_source f=4 75.47.
+- **Mostly the degree-aware X quantizer** (`--quant-parts` ablation, PubMed, λ = 0):
+  W only 79.20, B only 78.10, W+B 78.27, X only 76.70, all 75.93.
+- **Learning the X tables helps, but not enough.** With the tables frozen at their
+  initialization: 74.27. Learning only b: 76.60. Learning only the range: 74.77.
+  α lr 1e-2 / 3e-2: 74.50 / 76.67 (within noise).
+- **The penalty is sensitive** because Eq.(4)'s gradient on each degree's b scales with the
+  number of nodes of that degree × the layer dimension, and Adam turns any persistent push into
+  ~lr per step. PubMed has 7× Cora's nodes, and its real-valued TF-IDF features are not
+  lossless at 2 bits, unlike Cora's binary ones.
+- **Feature preprocessing matters on CiteSeer.** FP32 is 68.8 raw vs 71.4 row-normalized
+  (5 seeds; Tab.VI: 71.1). The "raw features" choice above was measured on Cora only, and under
+  the old α parameterization.
+- Next things to try: better X initialization than max/7 (e.g. MSE- or percentile-based
+  clip), longer QAT at a lower bits learning rate, and Eq.(4) normalized per layer.
+
 ## Known limitations / next steps
 
 - **b convergence:** Adam moves b by about `--lr-bits` per step, so 200 epochs allow about 2 bits
   of change. With a strong penalty, the memory may still be heading toward M_target at the
   end (check the `mem` log lines). Use more `--epochs-qat` or a higher `--lr-bits` if needed.
-- **λ / M_target sweep (Q-13):** not done yet. A dense target of 2.0 bits at λ=1e-5 gave a
-  sparse average of 1.76 on Cora, close to Tab.VI's 1.70.
-- **Scope:** GCN only. GIN and GraphSage (Q-12), and NELL and Reddit, are not implemented yet.
+- **λ / M_target sweep (Q-13):** Cora matches Tab.VI (λ = 1e-7). CiteSeer and PubMed do not yet
+  (see the 2026-11-15 results log).
+- **Scope:** GCN only. GIN and GraphSage (Q-12) and Reddit are not implemented yet. NELL is
+  loaded (sparse X^(0), PyG construction, Tab.II sizes reproduced).
+- **NELL source:** the official hosts are blocked from our cloud environment, so the loader
+  fetches a GitHub LFS mirror and verifies each file's sha256 (see `data.py`).
 - **Scales treated as exact:** the scale multiplications (α·β, γ, d^(−1/2)) are assumed
   exact. Their hardware precision is still open (Q-16).
