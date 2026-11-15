@@ -42,6 +42,9 @@ def parse_args(argv=None):
     p.add_argument("--x-param", default="range", choices=["range", "alpha"],
                    help="how the degree tables learn the scale: clip range c with α = c/q_max(b) "
                         "(default), or α directly. Same forward pass/hardware; see quant.py")
+    p.add_argument("--quant-parts", default="xwb",
+                   help="DEBUG ablation: which quantizers are active (x = degree-aware features, "
+                        "w = 4-bit weights, b = 4-bit B). Default 'xwb' is the real model")
     p.add_argument("--frac-bits", type=int, default=8, help="f in Q1.f for per_source mode")
     p.add_argument("--hidden", type=int, default=128, help="Tab.III: 128 for GCN")
     p.add_argument("--dropout", type=float, default=0.5)
@@ -164,6 +167,7 @@ def main(argv=None):
         if not args.fp32_only:
             model.calibrate(g.x, ops)
             model.quantize = True
+            model.quant_parts = args.quant_parts
             model.eval()
             with torch.no_grad():
                 row["ptq_test"] = accuracy(model(g.x, ops), g.y, g.test_idx)  # before QAT, for debugging

@@ -96,6 +96,10 @@ class QGCN(nn.Module):
         assert norm in NORM_MODES, norm
         self.dims, self.norm, self.frac_bits, self.dropout = dims, norm, frac_bits, dropout
         self.quantize = False
+        # Debug ablation (--quant-parts): which quantizers act in the forward pass when
+        # quantize=True. "xwb" = all (the real model). Dropping a letter passes that tensor
+        # through in float; its integer version is still computed for the metrics.
+        self.quant_parts = "xwb"
         L = len(dims) - 1
         self.weights = nn.ParameterList(
             [nn.Parameter(nn.init.xavier_uniform_(torch.empty(dims[l], dims[l + 1]))) for l in range(L)])
@@ -140,21 +144,25 @@ class QGCN(nn.Module):
         return total / ETA
 
     # ------------------------------------------------------------------ forward
+    def _quant_b(self, l: int, t: torch.Tensor):
+        tq, tbar = self.b_quant[l](t)
+        return (tq if "b" in self.quant_parts else t), tbar
+
     def _aggregate(self, B: torch.Tensor, l: int, ops: GraphOps, rec: dict | None):
         """Quantize B (if quantizing) and aggregate according to the norm mode."""
         if not self.quantize:
             return torch.sparse.mm(ops.a_norm, B)
         d = ops.dinv_sqrt.unsqueeze(1)
         if self.norm == "fp32":
-            Bq, Bbar = self.b_quant[l](B)
+            Bq, Bbar = self._quant_b(l, B)
             H = torch.sparse.mm(ops.a_norm, Bq)
             psum = None  # no integer datapath defined for real-valued Ã
         elif self.norm == "fold":
-            Bq, Bbar = self.b_quant[l](d * B)          # source factor before quantization
+            Bq, Bbar = self._quant_b(l, d * B)         # source factor before quantization
             H = d * torch.sparse.mm(ops.a_bin, Bq)     # destination factor in the Encoder
             psum = (lambda: torch.sparse.mm(ops.a_bin, Bbar)) if rec is not None else None
         else:  # per_source
-            Bq, Bbar = self.b_quant[l](B)
+            Bq, Bbar = self._quant_b(l, B)
             w = self.source_weights(ops).unsqueeze(1)
             H = d * torch.sparse.mm(ops.a_bin, w * Bq)
             if rec is not None:
@@ -175,8 +183,10 @@ class QGCN(nn.Module):
         for l in range(L):
             rec = {} if record else None
             if self.quantize:
-                x, xbar = self.x_quant[l](x, ops.deg)
-                W, _ = self.w_quant[l](self.weights[l])
+                xq, xbar = self.x_quant[l](x, ops.deg)
+                x = xq if "x" in self.quant_parts else x
+                Wq, _ = self.w_quant[l](self.weights[l])
+                W = Wq if "w" in self.quant_parts else self.weights[l]
                 if rec is not None:
                     rec["F"] = x.shape[1]
                     rec["nnz_per_node"] = _nnz_per_node(xbar, x.shape[0])
