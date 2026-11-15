@@ -123,3 +123,25 @@ def test_model_runs_all_modes_and_records():
         for r in recs:
             assert r["Bbar"].abs().max() <= 7
             assert (r["psum"] is None) == (norm == "fp32")
+
+
+def test_sparse_input_matches_dense():
+    """NELL path: a sparse COO X^(0) must give the same logits, metrics inputs and
+    gradients (weights, α, b) as the same X stored densely."""
+    g = _toy_graph()
+    ops = GraphOps.from_graph(g)
+    x_dense = g.x * (torch.rand_like(g.x) > 0.5)               # make it actually sparse
+    x_sparse = x_dense.to_sparse_coo()
+    outs = []
+    for x in (x_dense, x_sparse):
+        torch.manual_seed(0)
+        m = QGCN([5, 8, 2], int(g.deg.max()), norm="fold")
+        m.calibrate(x, ops)
+        m.quantize = True
+        m.eval()
+        logits, recs = m(x, ops, record=True)
+        logits.sum().backward()
+        outs.append((logits.detach(), recs[0]["nnz_per_node"],
+                     m.weights[0].grad, m.x_quant[0].log_scale.grad, m.x_quant[0].bits.grad))
+    for a, b in zip(*outs):
+        assert torch.allclose(a, b, atol=1e-5), (a, b)

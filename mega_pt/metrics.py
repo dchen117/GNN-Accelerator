@@ -42,12 +42,11 @@ def quant_report(model: QGCN, x: torch.Tensor, ops: GraphOps) -> dict:
     top = ops.deg >= torch.quantile(ops.deg.float(), 0.99)  # top-1% degree nodes
 
     for l, r in enumerate(recs):
-        xbar, nb = r["xbar"], r["node_bits"]          # (N,F), (N,)
-        N, Fdim = xbar.shape
+        nb, Fdim, nnz_per_node = r["node_bits"], r["F"], r["nnz_per_node"]   # (N,), int, (N,)
+        N = nb.numel()
         dense_bits = (nb * Fdim).sum().item()
         num["all"] += dense_bits
         den["all"] += N * Fdim
-        nnz_per_node = (xbar != 0).sum(1).float()
         out[f"L{l}_density"] = nnz_per_node.sum().item() / (N * Fdim)
         out[f"L{l}_mean_bits"] = nb.mean().item()
         if l >= 1:  # hidden layer inputs

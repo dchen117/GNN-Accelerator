@@ -27,14 +27,14 @@ import time
 import torch
 import torch.nn.functional as F
 
-from .data import load_planetoid
+from .data import load_dataset
 from .metrics import accuracy, quant_report
 from .model import ETA, NORM_MODES, GraphOps, QGCN
 
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--dataset", default="cora", choices=["cora", "citeseer", "pubmed"])
+    p.add_argument("--dataset", default="cora", choices=["cora", "citeseer", "pubmed", "nell"])
     p.add_argument("--feat-norm", default="none", choices=["row", "none"],
                    help="input preprocessing. 'none' (raw binary/TF-IDF) is the default: row "
                         "normalization makes layer-0 values tiny, many round to 0, QAT lost ~3 pts on Cora")
@@ -123,10 +123,10 @@ def bit_tables(model) -> dict:
 
 def main(argv=None):
     args = parse_args(argv)
-    g = load_planetoid(args.dataset, feat_norm=args.feat_norm)
+    g = load_dataset(args.dataset, feat_norm=args.feat_norm)
     ops = GraphOps.from_graph(g)
     print(g.summary())
-    dims = [g.x.shape[1], args.hidden, g.num_classes]
+    dims = [g.num_features, args.hidden, g.num_classes]
 
     # M_target (KB). Eq.(4) counts dense storage over each layer input (Q-10, Q-13).
     if args.target_dense_bits is not None:

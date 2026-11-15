@@ -97,7 +97,12 @@ class DegreeAwareQuantizer(nn.Module):
         clipped at the start; the losses then push α and b down.
         """
         qmax = qmax_from_bits(torch.tensor(B_INIT)).item()
-        row_max = x.abs().amax(dim=1)                       # (N,)
+        if x.is_sparse:   # NELL's X^(0): max over each row's stored non-zeros
+            x = x.coalesce()
+            row_max = torch.zeros(deg.numel(), dtype=x.dtype)
+            row_max.scatter_reduce_(0, x.indices()[0], x.values().abs(), reduce="amax")
+        else:
+            row_max = x.abs().amax(dim=1)                   # (N,)
         global_max = row_max.max().clamp_min(EPS)
         per_deg = torch.zeros_like(self.log_scale)
         per_deg.scatter_reduce_(0, deg, row_max, reduce="amax", include_self=True)
@@ -118,6 +123,19 @@ class DegreeAwareQuantizer(nn.Module):
         return round_half_away_ste(b) if rounded else b
 
     def forward(self, x: torch.Tensor, deg: torch.Tensor):
+        """Returns (x_q, x_bar). For a sparse COO x (NELL's X^(0), too big to store densely)
+        only the stored non-zeros are quantized -- zeros stay zero under Eq.(2) anyway --
+        and both outputs are sparse with the same pattern."""
+        if x.is_sparse:
+            x = x.coalesce()
+            idx = x.indices()
+            d = deg[idx[0]]                                           # degree of each nnz's row
+            alpha = self.scale[d]
+            qmax = qmax_from_bits(self.node_bits(d, rounded=True))
+            xq, xbar = eq2_quantize(x.values(), alpha, qmax)
+            # check_invariants=False: idx comes from an already-coalesced, validated tensor.
+            return (torch.sparse_coo_tensor(idx, xq, x.shape, is_coalesced=True, check_invariants=False),
+                    torch.sparse_coo_tensor(idx, xbar, x.shape, is_coalesced=True, check_invariants=False))
         alpha = self.scale[deg].unsqueeze(1)                          # (N, 1)
         qmax = qmax_from_bits(self.node_bits(deg, rounded=True)).unsqueeze(1)
         return eq2_quantize(x, alpha, qmax)

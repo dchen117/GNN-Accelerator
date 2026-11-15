@@ -38,6 +38,31 @@ from .data import Graph
 from .quant import ColumnQuantizer, DegreeAwareQuantizer, fixed_point_q1
 
 NORM_MODES = ("fp32", "fold", "per_source")
+
+
+def _dropout(x: torch.Tensor, p: float, training: bool) -> torch.Tensor:
+    """Dropout that also accepts a sparse COO x (NELL's X^(0)): drops stored non-zeros."""
+    if not x.is_sparse:
+        return F.dropout(x, p, training)
+    if not training or p == 0:
+        return x
+    x = x.coalesce()
+    return torch.sparse_coo_tensor(x.indices(), F.dropout(x.values(), p, True), x.shape,
+                                   is_coalesced=True, check_invariants=False)
+
+
+def _matmul(x: torch.Tensor, W: torch.Tensor) -> torch.Tensor:
+    """X W for dense or sparse COO X (the Combination step, Eq.(3))."""
+    return torch.sparse.mm(x, W) if x.is_sparse else x @ W
+
+
+def _nnz_per_node(xbar: torch.Tensor, n: int) -> torch.Tensor:
+    """Number of non-zero quantized features in each node's row (for the sparse bits metric)."""
+    if xbar.is_sparse:
+        xbar = xbar.coalesce()
+        rows = xbar.indices()[0][xbar.values() != 0]
+        return torch.bincount(rows, minlength=n).float()
+    return (xbar != 0).sum(1).float()
 ETA = 8 * 1024  # Eq.(4): bits -> KB
 
 
@@ -60,7 +85,8 @@ class GraphOps:
 class QGCN(nn.Module):
     """GCN, no bias (Q-08). `quantize=False` gives the plain FP32 GCN used for pretraining.
 
-    dims = [F, hidden, ..., classes]. Layer l has a DegreeAwareQuantizer for its input
+    dims = [F, hidden, ..., classes]. The input x may be dense or sparse COO (NELL);
+    hidden activations are always dense. Layer l has a DegreeAwareQuantizer for its input
     (Q-03, Q-10: including X^(0)), a weight quantizer and a B quantizer.
     """
 
@@ -152,15 +178,16 @@ class QGCN(nn.Module):
                 x, xbar = self.x_quant[l](x, ops.deg)
                 W, _ = self.w_quant[l](self.weights[l])
                 if rec is not None:
-                    rec["xbar"] = xbar
+                    rec["F"] = x.shape[1]
+                    rec["nnz_per_node"] = _nnz_per_node(xbar, x.shape[0])
                     rec["node_bits"] = self.x_quant[l].node_bits(ops.deg, rounded=True).detach()
             else:
                 W = self.weights[l]
             # Dropout AFTER the quantizer: the quantizer then sees the same value
             # distribution in training and eval (dropout's 1/(1-p) rescale would otherwise
             # bias the learned α). Our choice; the paper doesn't say.
-            x = F.dropout(x, self.dropout, self.training)
-            B = x @ W                                    # combination, Eq.(3)
+            x = _dropout(x, self.dropout, self.training)
+            B = _matmul(x, W)                            # combination, Eq.(3)
             x = self._aggregate(B, l, ops, rec)          # aggregation
             if l < L - 1:
                 x = F.relu(x)                            # Encoder ReLU (not on logits, Q-10)
@@ -184,7 +211,7 @@ class QGCN(nn.Module):
         for l in range(L):
             self.x_quant[l].init_from_activations(x, ops.deg)
             self.w_quant[l].init_from_tensor(self.weights[l])
-            B = x @ self.weights[l]
+            B = _matmul(x, self.weights[l])
             B_seen = ops.dinv_sqrt.unsqueeze(1) * B if self.norm == "fold" else B
             self.b_quant[l].init_from_tensor(B_seen)
             x = torch.sparse.mm(ops.a_norm, B)
