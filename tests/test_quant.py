@@ -202,3 +202,25 @@ def test_refit_clip_follows_bitwidth_and_keeps_sparse_dense_equal():
     qs.load_state_dict(q.state_dict())
     qs.refit_clip_(x.to_sparse(), deg)
     assert torch.allclose(qs.log_p, q.log_p)
+
+
+def test_lsq_scaling_changes_only_the_scale_gradient():
+    """--lsq: the forward pass is unchanged, the scale's gradient is multiplied by
+    g_d = 1/sqrt(N_d · Q_P), and b's gradient is untouched."""
+    torch.manual_seed(2)
+    x = torch.randn(50, 6)
+    deg = torch.randint(1, 4, (50,))
+    grads, outs = {}, {}
+    for lsq in (False, True):
+        q = DegreeAwareQuantizer(max_degree=3)
+        q.init_from_activations(x, deg, "max")
+        q.lsq = lsq
+        xq, _ = q(x, deg)
+        (xq * torch.linspace(-1, 1, 6)).sum().backward()
+        grads[lsq] = (q.log_p.grad.clone(), q.bits.grad.clone())
+        outs[lsq] = xq.detach()
+    assert torch.equal(outs[False], outs[True])
+    n = torch.bincount(deg, minlength=4).float() * x.shape[1]
+    g = 1.0 / torch.sqrt(n.clamp_min(1) * 7.0)                     # B_INIT = 4 -> Q_P = 7
+    assert torch.allclose(grads[True][0], grads[False][0] * g, atol=1e-7)
+    assert torch.allclose(grads[True][1], grads[False][1])

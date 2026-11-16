@@ -106,6 +106,7 @@ and the measurement is given.
 | Choice | Why (measured on Cora, seeds 0–1, no memory penalty, 2026-11-14) |
 |---|---|
 | Scales are learned as log α, log β, log γ | With linear α at Adam lr 0.01, α changed by about 100% per step and QAT accuracy collapsed (q_test ≈ 40%). |
+| `--lsq` (off): LSQ gradient scaling g = 1/sqrt(N·Q_P) on the degree tables' learned scale; `--alpha-opt sgd` to use SGD for it | Tested 2026-11-16 for fidelity (paper cites LSQ [13]). Did not help; see Results log. |
 | Degree tables learn the **clip range** c_d, with α_d = c_d / (2^(round(b_d)−1) − 1) (`--x-param range`, default; added 2026-11-15) | With α learned directly, lowering b at fixed α shrinks the clip range 2× per bit. On Cora's binary features, b 4→2 maps every 1 to α = 1/7, so the task loss blocked bit reduction on layer 0, where 2 bits are lossless. The memory penalty then crushed layer 1 instead (density 10%, q_test ≈ 75–78%). With the clip range, layer 0 goes to 2 bits even without a penalty: Cora λ=0 gives 80.83 ± 0.91 at 2.46 sparse bits, vs 80.57 at 3.80. The forward pass and the stored α are unchanged; this only changes optimization. |
 | **MSE init for the W/B column scales** (`--wb-init mse`, default since 2026-11-16) | NELL: a few hub rows set each B column's max/7, and most entries round to 0. NELL seed 2 PTQ 21.0 → 56.0 (FP32 58.1); NELL QAT λ = 0, 3 seeds: 54.56 ± 9.01 → **58.93 ± 3.50** (FP32 60.85). Neutral on the rest (3 seeds, λ = 1e-6/1e-7): Cora 81.67 → 81.87, CiteSeer 70.33 → 69.93, PubMed 78.97 → 78.93. Amends Q-08/Q-09 init only. |
 | `--lr-bits 2e-2` (default since 2026-11-15) | At 1e-2, b moves about 2 bits in 200 epochs, and the earlier runs ended before the memory converged. |
@@ -283,6 +284,56 @@ FP32: 62.5 / 61.9 / 58.1 (60.85 ± 2.40).
   calibration* (0 QAT epochs) dropped seed 2 from 56.0 to 44.9 — on NELL's 186 classes, MSE on
   the hidden layer seems to be a weaker proxy than on the other datasets. Not investigated
   further; NELL has no GCN accuracy in Tab.VI.
+
+### 2026-11-16 — Fidelity check: can the scale be learned by gradient? (LSQ, α-direct)
+
+Why: the paper says the scales are *learned* (p.4 §III-A). The MSE re-fit above replaces
+that, which departs from a stated detail (fidelity rule, `docs/mega-kb/04-open-questions.md`).
+All runs: `--clip-refit 0` (scale learned by gradient), MSE init, W/B MSE init, 3 seeds (0–2),
+dense target 2.0 bits. Tab.VI: Cora 80.9 @ 1.70, CiteSeer 70.6 @ 1.87, PubMed 78.3 @ 2.50.
+
+**1. LSQ gradient scaling on the clip range c (`--x-param range`), λ = 1e-6.** q_test %:
+
+| Variant | CiteSeer | PubMed |
+|---|---|---|
+| MSE re-fit (current default), reference | 70.27 @ 0.96 | 78.93 @ 0.86 |
+| c learned, Adam | 48.6 | 28.2 |
+| c learned, Adam + `--lsq` | 49.1 | 28.9 |
+| c learned, SGD(0.9) + `--lsq`, lr 1e-2 | 63.4 | 30.9 |
+| same, lr 1e-1 / lr 1 (seed 0 only) | 63.9 / 63.7 | 39.7 / 36.8 |
+
+- LSQ does not help. With Adam it is a no-op by construction: Adam divides each entry's
+  gradient by its own running RMS, which cancels a per-entry constant g. With SGD it changes
+  step sizes, but no learning rate fixes it.
+- Cause, from the final tables (PubMed seed 0): the learned c ends at about 0.10–0.12 in
+  every variant, close to its 4-bit init. The MSE-best c after b drops to 2 is about 0.04.
+  The range does not follow b, so at 2 bits most inputs round to 0 (sparse bits 0.04–0.07).
+  The training loss is near 0 after FP32 pretraining on 60–140 labels, so the task gradient
+  on c is too weak to move it 2–3×. Gradient scaling can only resize that signal.
+
+**2. Learning α directly (`--x-param alpha`, the literal Eq.(2) parameterization),** Adam, no
+re-fit, no LSQ. Here lowering b at fixed α also shrinks the clip range, so the clipping cost
+reaches b's gradient directly.
+
+| Dataset | λ | q_test % | sparse bits | dense bits |
+|---|---|---|---|---|
+| Cora | 1e-7 | 81.50 ± 0.36 | 3.87 | 3.04 |
+| Cora | 1e-6 | 81.10 ± 0.26 | 3.26 | 2.35 |
+| Cora | 1e-5 | 80.97 ± 0.49 | 2.58 | 2.14 |
+| CiteSeer | 1e-7 | 69.43 ± 2.40 | 3.36 | 2.74 |
+| CiteSeer | 3e-7 | 67.80 ± 1.47 | 3.11 | 2.38 |
+| CiteSeer | 1e-6 | 67.80 ± 0.61 | 2.05 | 2.04 |
+| PubMed | 1e-7 | 79.63 ± 0.31 | 2.67 | 2.47 |
+| PubMed | 1e-6 | 79.73 ± 0.75 | 1.57 | 2.14 |
+
+- Learned bits now **vary with degree**, mostly in the hidden layer (e.g. PubMed λ = 1e-6,
+  layer 1, degrees 1–12: 4,3,2,3,3,3,3,3,3,3,4,3; Cora layer 1 mostly 4–5). With the re-fit,
+  every present degree ended at 2 bits.
+- vs Tab.VI: PubMed matches (better accuracy, fewer bits). Cora matches in accuracy at λ = 1e-5
+  but at 2.58 vs 1.70 bits. CiteSeer is 1–3 points short (PTQ already loses 1.7 of FP32's 71.1;
+  QAT loses more).
+- Not changed to default yet: the choice between the two is the user's (fidelity vs matching
+  Tab.VI's accuracy/bits). Reproduce: `--clip-refit 0 --x-param alpha`.
 
 ## Known limitations / next steps
 

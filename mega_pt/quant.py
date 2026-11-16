@@ -9,7 +9,8 @@ Decisions implemented here (docs/mega-kb/04-open-questions.md):
   Q-02  one (s, b) entry per integer degree 0..d_max.
   Q-03  one table per quantized layer input (each layer builds its own DegreeAwareQuantizer).
   Q-04  b continuous, clamped to [B_MIN, B_MAX]; forward uses round(b), backward is STE.
-  Q-05  STE for rounding; α gets the LSQ-equivalent gradient from autograd, no grad scaling.
+  Q-05  STE for rounding; α gets the LSQ-equivalent gradient from autograd. LSQ's gradient
+        scaling is optional (DegreeAwareQuantizer.lsq, train.py --lsq).
         Scales are learned in log space, by default as a clip range c with α = c/q_max(b)
         (implementation choices; see DegreeAwareQuantizer).
   Q-06  signed everywhere (X, W, B).
@@ -65,6 +66,18 @@ def eq2_quantize(x: torch.Tensor, alpha: torch.Tensor, qmax: torch.Tensor):
     level = torch.minimum(level, qmax)
     x_bar = torch.sign(x) * level
     return x_bar * alpha, x_bar.detach()
+
+
+def grad_scale(x: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
+    """LSQ gradient scaling (Esser et al., ICLR 2020, cited by MEGA as [13]).
+    Forward: x unchanged. Backward: the gradient reaching x is multiplied by g."""
+    return (x - x * g).detach() + x * g
+
+
+def lsq_scale_factor(n_elems: torch.Tensor, qmax: torch.Tensor) -> torch.Tensor:
+    """LSQ's g = 1 / sqrt(N · Q_P), where N = number of values sharing the scale and
+    Q_P = largest positive level. N is floored at 1 (degrees with no values get no gradient anyway)."""
+    return torch.rsqrt(n_elems.clamp_min(1.0) * qmax).detach()
 
 
 @torch.no_grad()
@@ -137,14 +150,26 @@ class DegreeAwareQuantizer(nn.Module):
         self.param = param
         self.log_p = nn.Parameter(torch.zeros(max_degree + 1))
         self.bits = nn.Parameter(torch.full((max_degree + 1,), B_INIT))
+        # LSQ gradient scaling of the learned scale (train.py --lsq). Off by default.
+        self.lsq = False
 
-    def alpha_table(self) -> torch.Tensor:
+    def alpha_table(self, n_elems: torch.Tensor | None = None) -> torch.Tensor:
         """α per degree (shape d_max+1), differentiable w.r.t. log_p and (in "range" mode,
-        through the STE-rounded q_max) w.r.t. b."""
-        if self.param == "alpha":
-            return self.log_p.exp()
+        through the STE-rounded q_max) w.r.t. b.
+
+        n_elems: values quantized with each degree's scale in this forward pass. When given
+        and self.lsq is set, the gradient reaching the learned scale (c in "range" mode, α in
+        "alpha" mode) is multiplied by LSQ's g_d = 1/sqrt(N_d · Q_P,d). Only the scale's own
+        gradient is scaled; b's gradient through the clipping (eq2_quantize) is untouched.
+        Why: the paper says the scales are learned (p.4 §III-A) and cites LSQ [13]; N_d spans
+        orders of magnitude across degrees, so one learning rate cannot suit every entry.
+        """
         b = round_half_away_ste(self.bits.clamp(B_MIN, B_MAX))
-        return self.log_p.exp() / qmax_from_bits(b)
+        qmax = qmax_from_bits(b)
+        p = self.log_p.exp()
+        if self.lsq and n_elems is not None:
+            p = grad_scale(p, lsq_scale_factor(n_elems, qmax.detach()))
+        return p if self.param == "alpha" else p / qmax
 
     @property
     def scale(self) -> torch.Tensor:
@@ -227,13 +252,15 @@ class DegreeAwareQuantizer(nn.Module):
             x = x.coalesce()
             idx = x.indices()
             d = deg[idx[0]]                                           # degree of each nnz's row
-            alpha = self.alpha_table()[d]
+            n = torch.bincount(d, minlength=self.log_p.numel()).to(x.dtype)  # nnz per degree
+            alpha = self.alpha_table(n)[d]
             qmax = qmax_from_bits(self.node_bits(d, rounded=True))
             xq, xbar = eq2_quantize(x.values(), alpha, qmax)
             # check_invariants=False: idx comes from an already-coalesced, validated tensor.
             return (torch.sparse_coo_tensor(idx, xq, x.shape, is_coalesced=True, check_invariants=False),
                     torch.sparse_coo_tensor(idx, xbar, x.shape, is_coalesced=True, check_invariants=False))
-        alpha = self.alpha_table()[deg].unsqueeze(1)                  # (N, 1)
+        n = torch.bincount(deg, minlength=self.log_p.numel()).to(x.dtype) * x.shape[1]
+        alpha = self.alpha_table(n)[deg].unsqueeze(1)                 # (N, 1)
         qmax = qmax_from_bits(self.node_bits(deg, rounded=True)).unsqueeze(1)
         return eq2_quantize(x, alpha, qmax)
 

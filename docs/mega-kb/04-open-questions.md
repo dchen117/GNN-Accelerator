@@ -99,6 +99,14 @@ should say which kind it is: filling a gap, or departing from a stated detail.
     - Trade-off: none in hardware (one α per degree either way). In optimization, c is no longer
       trained for the task loss directly; it minimizes reconstruction error, which is a proxy.
       Old behaviour: `--x-init max --clip-refit 0`.
+    - **Fidelity note 2026-11-16:** the re-fit departs from a stated detail (p.4 §III-A: the
+      scale is "learned"). Tested alternatives with the scale learned by gradient
+      (`mega_pt/README.md`, "Fidelity check"): LSQ gradient scaling on c does not help (c stays
+      near its 4-bit init and cannot follow b). Learning α directly (`--x-param alpha`, no
+      re-fit) works: Cora 81.0 @ 2.58 sparse bits (λ 1e-5), CiteSeer 67.8 @ 2.05 (λ 1e-6),
+      PubMed 79.7 @ 1.57 (λ 1e-6), with bits that vary by degree. **Open: user to choose**
+      re-fit (matches Tab.VI, uniform 2 bits) vs α-direct (as stated, degree-varying bits,
+      CiteSeer 1–3 points short, Cora more bits).
 
 ### Q-05 — Gradient through rounding `[PT]` blocking
 - Says: Eq.(2) uses ⌊|x|/α + 0.5⌋ (p.5).
@@ -109,6 +117,8 @@ should say which kind it is: filling a gap, or departing from a stated detail.
   gradient without LSQ's gradient scaling.** (2026-11-14)
   - Why: the paper cites LSQ [13]; writing the quantizer this way gives LSQ's gradient for free.
   - Trade-off: no gradient scaling; add it only if α training is unstable.
+  - 2026-11-16: LSQ's gradient scaling tested as `--lsq` (off by default). With Adam it cancels
+    (per-entry constant factor); with SGD it did not fix the learned clip range. Not adopted.
 
 ### Q-06 — Signed vs unsigned integer range `[PT][SIM]` blocking
 - Says: Eq.(2) is sign(x)·min(round(|x|/α), 2^(b−1)−1) (p.5). The Encoder applies ReLU before

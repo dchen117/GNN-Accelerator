@@ -55,6 +55,13 @@ def parse_args(argv=None):
                    help="K > 0: re-fit the degree tables' clip ranges by MSE at the current "
                         "rounded b every K QAT epochs, instead of learning them (lr-alpha "
                         "is then ignored). 0 = learn by gradient. See quant.py refit_clip_")
+    p.add_argument("--lsq", action="store_true",
+                   help="LSQ gradient scaling g=1/sqrt(N*Q_P) on the degree tables' learned "
+                        "scale (only matters with --clip-refit 0, i.e. scales learned by gradient)")
+    p.add_argument("--alpha-opt", default="adam", choices=["adam", "sgd"],
+                   help="optimizer for the degree tables' scales. Adam normalizes each entry's "
+                        "step, which cancels LSQ's per-entry constant g; LSQ itself used SGD")
+    p.add_argument("--alpha-momentum", type=float, default=0.9, help="SGD momentum (--alpha-opt sgd)")
     p.add_argument("--x-init-bits", default=None,
                    help="starting bitwidth per layer, e.g. '4,2' (default: 4 everywhere, Q-04)")
     p.add_argument("--quant-parts", default="xwb",
@@ -117,26 +124,38 @@ def train_fp32(model, g, ops, args):
 
 def train_qat(model, g, ops, args, m_target_kb):
     """Quantization-aware fine-tuning with the Eq.(5) loss. Returns the final-epoch model."""
-    opt = torch.optim.Adam([
+    groups = [
         {"params": model.weight_params(), "lr": args.lr_qat_weights, "weight_decay": args.wd},
-        # with --clip-refit the clip ranges are set by MSE re-fits, not by the optimizer
-        {"params": model.alpha_params(), "lr": 0.0 if args.clip_refit else args.lr_alpha,
-         "weight_decay": 0.0},
         {"params": model.bit_params(), "lr": args.lr_bits, "weight_decay": 0.0},
         {"params": model.column_scale_params(), "lr": args.lr_colscale, "weight_decay": 0.0},
-    ])
+    ]
+    # with --clip-refit the clip ranges are set by MSE re-fits, not by the optimizer
+    alpha_lr = 0.0 if args.clip_refit else args.lr_alpha
+    for q in model.x_quant:
+        q.lsq = args.lsq
+    opts = []
+    if args.alpha_opt == "adam":
+        groups.append({"params": model.alpha_params(), "lr": alpha_lr, "weight_decay": 0.0})
+    else:
+        # LSQ setup: plain SGD with momentum, so the per-degree factor g changes step sizes
+        # (Adam divides it back out). Still on log c; see README "LSQ check".
+        opts.append(torch.optim.SGD(model.alpha_params(), lr=alpha_lr,
+                                    momentum=args.alpha_momentum))
+    opts.append(torch.optim.Adam(groups))
     for ep in range(args.epochs_qat):
         if args.clip_refit and ep % args.clip_refit == 0:
             model.refit_clips_(g.x, ops)
         model.train()
-        opt.zero_grad()
+        for o in opts:
+            o.zero_grad()
         logits = model(g.x, ops)
         task = F.cross_entropy(logits[g.train_idx], g.y[g.train_idx])
         mem = model.memory_kb(ops.deg)                        # Eq.(4) inner term, KB
         penalty = (mem - m_target_kb) ** 2 if args.lam > 0 else torch.zeros(())
         loss = task + args.lam * penalty                      # Eq.(5)
         loss.backward()
-        opt.step()
+        for o in opts:
+            o.step()
         model.clamp_quant_params_()                           # keep b in [2, 8], scales > 0
         if args.log_every and (ep % args.log_every == 0 or ep == args.epochs_qat - 1):
             model.eval()
