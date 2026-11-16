@@ -14,6 +14,14 @@ which implementation path it blocks:
 
 The paper is never "corrected" here. Possible readings are listed but not chosen.
 
+**Fidelity rule (user, 2026-11-16).** This model is the MEGA *baseline* for comparing against
+our own design, so it must stay fair to MEGA. Do not deviate from what the paper states about
+its algorithm or hardware, even when a deviation would be simpler or more accurate. Choose
+freely only where the paper is silent or inconsistent, and prefer the reading closest to what
+it does state. An outcome of training that removes a key MEGA idea (e.g. every degree learning
+the same bitwidth) is a finding to report, never a design choice to adopt. Every decision below
+should say which kind it is: filling a gap, or departing from a stated detail.
+
 ---
 
 ## A. Algorithm (Degree-Aware Quantization)
