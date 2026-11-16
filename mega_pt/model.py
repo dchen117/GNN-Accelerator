@@ -1,4 +1,13 @@
-"""GCN with MEGA's Degree-Aware quantization (PyTorch "fake-quant" model).
+"""GCN / GIN / GraphSage with MEGA's Degree-Aware quantization (PyTorch "fake-quant" model).
+
+All three models use Eq.(1)'s single-W form, X' = σ(Ã X W) (p.3 says the three "can be
+uniformly represented" by it). Per Q-12 they differ only in Ã (see GraphOps.build):
+  gcn   Ã = D^-1/2 (A+I) D^-1/2                         (Tab.III: Add aggregation)
+  gin   Ã = A+I, i.e. GIN-0 (ε = 0) with ONE linear layer per GNN layer, sum aggregation
+  sage  Ã = D_s^-1 (A_s+I): mean over the node itself plus up to 25 uniformly sampled
+        in-neighbors (Tab.III: Mean, 25 samples); single W, no concat
+Write s = source factor and t = destination factor, so Ã = diag(t) (A+I) diag(s).
+The text below says d^-1/2 for GCN; for GIN s = t = 1, for GraphSage s = 1, t = 1/d.
 
 Layer l computes, in MEGA's execution order Ã(XW) (p.3 §II-A):
 
@@ -14,7 +23,9 @@ extra rounding happens between the quantization points (float error aside). The 
 multiplications (α·β, γ, d^-1/2) are treated as exact; their hardware precision is open
 (Q-16).
 
-NORM MODES (Q-11, pending test). Ã = D^-1/2 (A+I) D^-1/2 with d = in-degree incl. self-loop.
+NORM MODES (Q-11: decided "fold"). Written for GCN, Ã = D^-1/2 (A+I) D^-1/2 with d = in-degree
+incl. self-loop. In code the source factor is ops.src_scale and the destination factor
+ops.dst_scale, so the same modes serve GIN (no-op factors) and GraphSage (1/d in the Encoder).
   "fp32"       H = Ã · Q(B)
                Ideal reference: real-valued edge weights. Not what our hardware does.
   "fold"       H = D^-1/2 · (A+I) · Q(D^-1/2 B)
@@ -76,24 +87,77 @@ def _nnz_per_node(xbar: torch.Tensor, n: int) -> torch.Tensor:
 ETA = 8 * 1024  # Eq.(4): bits -> KB
 
 
+MODELS = ("gcn", "gin", "sage")
+
+
+def sample_neighbors(src: torch.Tensor, dst: torch.Tensor, num_nodes: int, k: int,
+                     generator: torch.Generator | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+    """GraphSage neighbor sampling (Q-12): for every destination node keep at most k of its
+    in-neighbors, chosen uniformly without replacement, plus its self-loop (always kept, so
+    the sampled degree is min(d-1, k) + 1, which counts the self-loop as Q-01 does).
+
+    Vectorized: give each non-self edge a random key in [0, 1), sort by dst + key (groups edges
+    by destination in random order), and keep the first k of each group."""
+    self_loop = src == dst
+    s, d = src[~self_loop], dst[~self_loop]
+    key = d.double() + torch.rand(d.numel(), generator=generator, dtype=torch.float64)
+    order = torch.argsort(key)
+    s, d = s[order], d[order]
+    first = torch.searchsorted(d, d, right=False)          # index where each dst's group starts
+    keep = (torch.arange(d.numel()) - first) < k
+    loops = torch.arange(num_nodes)
+    return torch.cat([s[keep], loops]), torch.cat([d[keep], loops])
+
+
 @dataclass
 class GraphOps:
-    """Precomputed graph operators shared by all layers and epochs."""
+    """Graph operators for one forward pass: Ã = diag(dst_scale) · (A+I) · diag(src_scale).
 
-    deg: torch.Tensor        # (N,) int64, in-degree incl. self-loop (Q-01)
-    a_bin: torch.Tensor      # sparse (N,N) binary A+I, rows = destinations
-    a_norm: torch.Tensor     # sparse (N,N) D^-1/2 (A+I) D^-1/2
-    dinv_sqrt: torch.Tensor  # (N,) d^-1/2
+    GCN/GIN build this once. GraphSage builds one per sampled graph (train.py resamples every
+    training epoch and uses one fixed sample, seeded by the run seed, for evaluation)."""
+
+    deg: torch.Tensor        # (N,) int64, in-degree incl. self-loop (Q-01), of THIS graph
+                             # (for GraphSage: the sampled degree, which is what the hardware's
+                             # CSC column length and therefore its degree-table lookup sees)
+    a_bin: torch.Tensor      # sparse (N,N) binary A+I, rows = destinations (what hardware stores)
+    a_norm: torch.Tensor     # sparse (N,N) real-valued Ã (FP32 reference)
+    src_scale: torch.Tensor  # (N,) source factor s_j: GCN d^-1/2, GIN 1, GraphSage 1
+    dst_scale: torch.Tensor  # (N,) destination factor t_i: GCN d^-1/2, GIN 1, GraphSage 1/d
 
     @classmethod
-    def from_graph(cls, g: Graph) -> "GraphOps":
-        dinv = g.deg.float().pow(-0.5)
-        vals = dinv[g.edge_dst] * dinv[g.edge_src]
-        return cls(deg=g.deg, a_bin=g.adjacency(), a_norm=g.adjacency(vals), dinv_sqrt=dinv)
+    def build(cls, src: torch.Tensor, dst: torch.Tensor, num_nodes: int, model: str = "gcn") -> "GraphOps":
+        assert model in MODELS, model
+        deg = torch.bincount(dst, minlength=num_nodes)
+        d = deg.float()
+        if model == "gcn":
+            s = t = d.pow(-0.5)
+        elif model == "gin":                                 # GIN-0: plain sum over A+I
+            s = t = torch.ones(num_nodes)
+        else:                                                # sage: mean = (1/d) Σ over A+I
+            s, t = torch.ones(num_nodes), 1.0 / d
+        idx = torch.stack([dst, src])
+        shape = (num_nodes, num_nodes)
+        # Indices come from the loader (validated there) or are a subset of them (sampling).
+        a_bin = torch.sparse_coo_tensor(idx, torch.ones(src.numel()), shape,
+                                        check_invariants=False).coalesce()
+        a_norm = torch.sparse_coo_tensor(idx, t[dst] * s[src], shape,
+                                         check_invariants=False).coalesce()
+        return cls(deg=deg, a_bin=a_bin, a_norm=a_norm, src_scale=s, dst_scale=t)
+
+    @classmethod
+    def from_graph(cls, g: Graph, model: str = "gcn", samples: int | None = None,
+                   generator: torch.Generator | None = None) -> "GraphOps":
+        """samples=k: GraphSage neighbor sampling (k neighbors + self), see sample_neighbors."""
+        src, dst = g.edge_src, g.edge_dst
+        if samples:
+            src, dst = sample_neighbors(src, dst, g.num_nodes, samples, generator)
+        return cls.build(src, dst, g.num_nodes, model)
 
 
 class QGCN(nn.Module):
-    """GCN, no bias (Q-08). `quantize=False` gives the plain FP32 GCN used for pretraining.
+    """Eq.(1) GNN, no bias (Q-08): GCN, GIN-0 or GraphSage-mean depending on the GraphOps passed
+    in (the layer itself is identical, Q-12). `quantize=False` gives the plain FP32 model used
+    for pretraining. max_degree must cover ops.deg (GraphSage: samples + 1).
 
     dims = [F, hidden, ..., classes]. The input x may be dense or sparse COO (NELL);
     hidden activations are always dense. Layer l has a DegreeAwareQuantizer for its input
@@ -142,8 +206,9 @@ class QGCN(nn.Module):
             m.clamp_()
 
     def source_weights(self, ops: GraphOps) -> torch.Tensor:
-        """w_j for per_source mode: Q1.f fixed point of d_j^-1/2."""
-        return fixed_point_q1(ops.dinv_sqrt, self.frac_bits)
+        """w_j for per_source mode: Q1.f fixed point of the source factor (GCN d_j^-1/2;
+        exactly 1.0 for GIN and GraphSage)."""
+        return fixed_point_q1(ops.src_scale, self.frac_bits)
 
     def memory_kb(self, deg: torch.Tensor) -> torch.Tensor:
         """Eq.(4) inner term: (1/η) Σ_l Σ_i dim^l · b_i^l with CONTINUOUS b (Q-04),
@@ -162,21 +227,21 @@ class QGCN(nn.Module):
         """Quantize B (if quantizing) and aggregate according to the norm mode."""
         if not self.quantize:
             return torch.sparse.mm(ops.a_norm, B)
-        d = ops.dinv_sqrt.unsqueeze(1)
+        s, t = ops.src_scale.unsqueeze(1), ops.dst_scale.unsqueeze(1)
         if self.norm == "fp32":
             Bq, Bbar = self._quant_b(l, B)
             H = torch.sparse.mm(ops.a_norm, Bq)
             psum = None  # no integer datapath defined for real-valued Ã
         elif self.norm == "fold":
-            Bq, Bbar = self._quant_b(l, d * B)         # source factor before quantization
-            H = d * torch.sparse.mm(ops.a_bin, Bq)     # destination factor in the Encoder
+            Bq, Bbar = self._quant_b(l, s * B)         # source factor before quantization
+            H = t * torch.sparse.mm(ops.a_bin, Bq)     # destination factor in the Encoder
             psum = (lambda: torch.sparse.mm(ops.a_bin, Bbar)) if rec is not None else None
         else:  # per_source
             Bq, Bbar = self._quant_b(l, B)
             w = self.source_weights(ops).unsqueeze(1)
-            H = d * torch.sparse.mm(ops.a_bin, w * Bq)
+            H = t * torch.sparse.mm(ops.a_bin, w * Bq)
             if rec is not None:
-                w_int = torch.floor(ops.dinv_sqrt * 2.0 ** self.frac_bits + 0.5).unsqueeze(1)
+                w_int = torch.floor(ops.src_scale * 2.0 ** self.frac_bits + 0.5).unsqueeze(1)
                 psum = lambda: torch.sparse.mm(ops.a_bin, w_int * Bbar)  # integer AU sums
             else:
                 psum = None
@@ -251,7 +316,7 @@ class QGCN(nn.Module):
                                                  bits=init_bits[l] if init_bits else B_INIT)
             self.w_quant[l].init_from_tensor(self.weights[l], wb_init)
             B = _matmul(x, self.weights[l])
-            B_seen = ops.dinv_sqrt.unsqueeze(1) * B if self.norm == "fold" else B
+            B_seen = ops.src_scale.unsqueeze(1) * B if self.norm == "fold" else B
             self.b_quant[l].init_from_tensor(B_seen, wb_init)
             x = torch.sparse.mm(ops.a_norm, B)
             if l < L - 1:

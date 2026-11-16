@@ -1,4 +1,8 @@
-"""Train and evaluate the Degree-Aware quantized GCN.
+"""Train and evaluate the Degree-Aware quantized GCN / GIN / GraphSage (--model, Q-12).
+
+GraphSage (--model sage): every training epoch (FP32 and QAT) uses a fresh neighbor sample
+(--samples per node, plus self); evaluation, calibration and all reported metrics use ONE
+fixed sample drawn from a generator seeded by the run seed (Q-12: sampling also at inference).
 
 Pipeline per seed (Q-14):
   1. FP32 GCN pretraining (Adam, lr 0.01, wd 5e-4, dropout 0.5). Keep the best-val-acc epoch.
@@ -15,6 +19,8 @@ Examples
   python -m mega_pt.train --dataset pubmed --lam 1e-6 --target-dense-bits 2.0    # Tab.VI setting
   python -m mega_pt.train --dataset cora --lam 1e-5 --target-dense-bits 2.0      # (Cora needs 1e-5)
   python -m mega_pt.train --dataset cora --norm per_source --frac-bits 6 --lam 1e-7 --target-dense-bits 2.0
+  python -m mega_pt.train --model gin --dataset citeseer --lam 1e-6 --target-dense-bits 2.0
+  python -m mega_pt.train --model sage --dataset cora --lam 1e-6 --target-dense-bits 2.0
 
 Results go to runs/<run-name>/results.json (per-seed metrics, mean/std summary, args) and
 runs/<run-name>/bits_seed<k>.json (learned per-degree bit/scale tables).
@@ -33,11 +39,16 @@ import torch.nn.functional as F
 
 from .data import load_dataset
 from .metrics import accuracy, quant_report
-from .model import ETA, NORM_MODES, GraphOps, QGCN
+from .model import ETA, MODELS, NORM_MODES, GraphOps, QGCN
 
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--model", default="gcn", choices=MODELS,
+                   help="Q-12: gcn; gin = GIN-0 (ε=0, one linear layer, sum over A+I); "
+                        "sage = GraphSage-mean over self + sampled neighbors, single W")
+    p.add_argument("--samples", type=int, default=25,
+                   help="GraphSage neighbors sampled per node (Tab.III: 25); ignored otherwise")
     p.add_argument("--dataset", default="cora", choices=["cora", "citeseer", "pubmed", "nell"])
     p.add_argument("--feat-norm", default="row", choices=["row", "none"],
                    help="input preprocessing: row-normalize X (Kipf's GCN preprocessing; default) "
@@ -73,7 +84,8 @@ def parse_args(argv=None):
                    help="DEBUG ablation: which quantizers are active (x = degree-aware features, "
                         "w = 4-bit weights, b = 4-bit B). Default 'xwb' is the real model")
     p.add_argument("--frac-bits", type=int, default=8, help="f in Q1.f for per_source mode")
-    p.add_argument("--hidden", type=int, default=128, help="Tab.III: 128 for GCN")
+    p.add_argument("--hidden", type=int, default=None,
+                   help="default from Tab.III: 128 for GCN and GIN, 256 for GraphSage")
     p.add_argument("--dropout", type=float, default=0.5)
     p.add_argument("--lr", type=float, default=0.01, help="weights, FP32 pretraining")
     # QAT learning rates. Tuned on Cora seed 0-1 (no memory penalty), see mega_pt/README.md:
@@ -105,14 +117,16 @@ def parse_args(argv=None):
     return p.parse_args(argv)
 
 
-def train_fp32(model, g, ops, args):
-    """Plain GCN training; returns test acc at the best-validation epoch."""
+def train_fp32(model, g, ops, args, train_ops):
+    """Plain (unquantized) training; returns test acc at the best-validation epoch.
+    ops: the evaluation graph; train_ops(): the graph for one training step (a fresh
+    neighbor sample for GraphSage, else the same ops)."""
     opt = torch.optim.Adam(model.weight_params(), lr=args.lr, weight_decay=args.wd)
     best_val, best_state = -1.0, None
     for ep in range(args.epochs_fp32):
         model.train()
         opt.zero_grad()
-        loss = F.cross_entropy(model(g.x, ops)[g.train_idx], g.y[g.train_idx])
+        loss = F.cross_entropy(model(g.x, train_ops())[g.train_idx], g.y[g.train_idx])
         loss.backward()
         opt.step()
         model.eval()
@@ -127,7 +141,7 @@ def train_fp32(model, g, ops, args):
         return accuracy(model(g.x, ops), g.y, g.test_idx), best_val
 
 
-def train_qat(model, g, ops, args, m_target_kb):
+def train_qat(model, g, ops, args, m_target_kb, train_ops):
     """Quantization-aware fine-tuning with the Eq.(5) loss. Returns the final-epoch model."""
     groups = [
         {"params": model.weight_params(), "lr": args.lr_qat_weights, "weight_decay": args.wd},
@@ -153,9 +167,10 @@ def train_qat(model, g, ops, args, m_target_kb):
         model.train()
         for o in opts:
             o.zero_grad()
-        logits = model(g.x, ops)
+        step_ops = train_ops()
+        logits = model(g.x, step_ops)
         task = F.cross_entropy(logits[g.train_idx], g.y[g.train_idx])
-        mem = model.memory_kb(ops.deg)                        # Eq.(4) inner term, KB
+        mem = model.memory_kb(step_ops.deg)                   # Eq.(4) inner term, KB
         penalty = (mem - m_target_kb) ** 2 if args.lam > 0 else torch.zeros(())
         loss = task + args.lam * penalty                      # Eq.(5)
         loss.backward()
@@ -180,8 +195,10 @@ def bit_tables(model) -> dict:
 def main(argv=None):
     args = parse_args(argv)
     g = load_dataset(args.dataset, feat_norm=args.feat_norm)
-    ops = GraphOps.from_graph(g)
     print(g.summary())
+    sampled = args.model == "sage"
+    if args.hidden is None:
+        args.hidden = 256 if args.model == "sage" else 128          # Tab.III
     dims = [g.num_features, args.hidden, g.num_classes]
 
     # M_target (KB). Eq.(4) counts dense storage over each layer input (Q-10, Q-13).
@@ -196,7 +213,7 @@ def main(argv=None):
     if args.lam > 0:
         print(f"M_target = {m_target:.1f} KB, λ = {args.lam}")
 
-    name = args.run_name or (f"{args.dataset}_{args.norm}"
+    name = args.run_name or (("" if args.model == "gcn" else f"{args.model}_") + f"{args.dataset}_{args.norm}"
                              + (f"_f{args.frac_bits}" if args.norm == "per_source" else "")
                              + f"_lam{args.lam:g}" + (f"_mt{m_target:.0f}" if args.lam > 0 else ""))
     out_dir = os.path.join(args.out_dir, name)
@@ -206,9 +223,19 @@ def main(argv=None):
     for seed in range(args.seed_start, args.seed_start + args.seeds):
         t0 = time.time()
         torch.manual_seed(seed)
-        model = QGCN(dims, int(g.deg.max()), norm=args.norm, frac_bits=args.frac_bits, dropout=args.dropout,
+        if sampled:
+            # one fixed evaluation sample per run, and a separate stream for training samples
+            ops = GraphOps.from_graph(g, "sage", args.samples, torch.Generator().manual_seed(seed))
+            train_gen = torch.Generator().manual_seed(10_000 + seed)
+            train_ops = lambda: GraphOps.from_graph(g, "sage", args.samples, train_gen)
+            max_degree = args.samples + 1          # degree tables cover every sampled degree
+        else:
+            ops = GraphOps.from_graph(g, args.model)
+            train_ops = lambda: ops
+            max_degree = int(g.deg.max())
+        model = QGCN(dims, max_degree, norm=args.norm, frac_bits=args.frac_bits, dropout=args.dropout,
                      x_param=args.x_param)
-        fp32_test, fp32_val = train_fp32(model, g, ops, args)
+        fp32_test, fp32_val = train_fp32(model, g, ops, args, train_ops)
         row = {"seed": seed, "fp32_test": fp32_test, "fp32_val": fp32_val}
         if not args.fp32_only:
             model.calibrate(g.x, ops, args.x_init,
@@ -219,7 +246,7 @@ def main(argv=None):
             model.eval()
             with torch.no_grad():
                 row["ptq_test"] = accuracy(model(g.x, ops), g.y, g.test_idx)  # before QAT, for debugging
-            train_qat(model, g, ops, args, m_target)
+            train_qat(model, g, ops, args, m_target, train_ops)
             model.eval()
             with torch.no_grad():
                 logits = model(g.x, ops)

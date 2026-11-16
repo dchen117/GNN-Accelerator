@@ -95,34 +95,77 @@ def _toy_graph():
 
 
 def test_norm_modes_agree_without_quantization_error():
-    """Q-11: fold and per_source compute the same Ã B as fp32 when nothing rounds.
-    We force this by using huge-precision w (f=30) and comparing the un-quantized algebra."""
+    """Q-11: fold and per_source compute the same Ã B as fp32 when nothing rounds, for every
+    model's Ã (Q-12). We force this by using huge-precision w (f=30) and comparing the
+    un-quantized algebra."""
     g = _toy_graph()
-    ops = GraphOps.from_graph(g)
-    B = torch.randn(4, 3)
-    d = ops.dinv_sqrt[:, None]
-    ref = torch.sparse.mm(ops.a_norm, B)
-    fold = d * torch.sparse.mm(ops.a_bin, d * B)
-    w = fixed_point_q1(ops.dinv_sqrt, 30)[:, None]
-    per_source = d * torch.sparse.mm(ops.a_bin, w * B)
-    assert torch.allclose(ref, fold, atol=1e-6)
-    assert torch.allclose(ref, per_source, atol=1e-6)
+    for model in ("gcn", "gin", "sage"):
+        ops = GraphOps.from_graph(g, model)
+        B = torch.randn(4, 3)
+        s, t = ops.src_scale[:, None], ops.dst_scale[:, None]
+        ref = torch.sparse.mm(ops.a_norm, B)
+        fold = t * torch.sparse.mm(ops.a_bin, s * B)
+        w = fixed_point_q1(ops.src_scale, 30)[:, None]
+        per_source = t * torch.sparse.mm(ops.a_bin, w * B)
+        assert torch.allclose(ref, fold, atol=1e-6), model
+        assert torch.allclose(ref, per_source, atol=1e-6), model
+
+
+def test_model_aggregations_q12():
+    """Q-12: GIN-0 sums over A+I (no scaling), GraphSage averages over A+I (rows sum to 1),
+    GCN is symmetric D^-1/2 (A+I) D^-1/2."""
+    g = _toy_graph()
+    A = g.adjacency().to_dense()
+    d = A.sum(1)
+    gin = GraphOps.from_graph(g, "gin").a_norm.to_dense()
+    sage = GraphOps.from_graph(g, "sage").a_norm.to_dense()
+    gcn = GraphOps.from_graph(g, "gcn").a_norm.to_dense()
+    assert torch.equal(gin, A)
+    assert torch.allclose(sage, A / d[:, None])
+    assert torch.allclose(sage.sum(1), torch.ones(4))
+    assert torch.allclose(gcn, A / torch.sqrt(d[:, None] * d[None, :]))
+    assert torch.equal(GraphOps.from_graph(g, "gin").deg, g.deg)
+
+
+def test_sample_neighbors_caps_degree_keeps_self_loop():
+    """GraphSage sampling (Q-12): each node keeps its self-loop plus min(d-1, k) distinct real
+    in-neighbors; nodes with d-1 <= k keep all of them; a fixed generator seed is reproducible."""
+    from mega_pt.model import sample_neighbors
+    torch.manual_seed(0)
+    n, k = 50, 3
+    # random graph without self-loops, then add them (as the loader does)
+    src = torch.randint(0, n, (600,))
+    dst = torch.randint(0, n, (600,))
+    pairs = torch.unique(torch.stack([src, dst])[:, src != dst], dim=1)
+    src = torch.cat([pairs[0], torch.arange(n)])
+    dst = torch.cat([pairs[1], torch.arange(n)])
+    full_deg = torch.bincount(dst, minlength=n)
+    s1, d1 = sample_neighbors(src, dst, n, k, torch.Generator().manual_seed(7))
+    s2, d2 = sample_neighbors(src, dst, n, k, torch.Generator().manual_seed(7))
+    assert torch.equal(s1, s2) and torch.equal(d1, d2)
+    deg = torch.bincount(d1, minlength=n)
+    assert torch.equal(deg, torch.clamp(full_deg - 1, max=k) + 1)
+    assert ((s1 == d1).sum() == n)                                   # every self-loop kept once
+    edges = set(zip(src.tolist(), dst.tolist()))
+    sampled = list(zip(s1.tolist(), d1.tolist()))
+    assert all(e in edges for e in sampled) and len(set(sampled)) == len(sampled)
 
 
 def test_model_runs_all_modes_and_records():
     g = _toy_graph()
-    ops = GraphOps.from_graph(g)
-    for norm in ("fp32", "fold", "per_source"):
-        m = QGCN([5, 8, 2], int(g.deg.max()), norm=norm, frac_bits=6)
-        m.calibrate(g.x, ops)
-        m.quantize = True
-        m.eval()
-        logits, recs = m(g.x, ops, record=True)
-        assert logits.shape == (4, 2)
-        assert len(recs) == 2
-        for r in recs:
-            assert r["Bbar"].abs().max() <= 7
-            assert (r["psum"] is None) == (norm == "fp32")
+    for model in ("gcn", "gin", "sage"):
+        ops = GraphOps.from_graph(g, model, samples=1 if model == "sage" else None)
+        for norm in ("fp32", "fold", "per_source"):
+            m = QGCN([5, 8, 2], int(ops.deg.max()), norm=norm, frac_bits=6)
+            m.calibrate(g.x, ops)
+            m.quantize = True
+            m.eval()
+            logits, recs = m(g.x, ops, record=True)
+            assert logits.shape == (4, 2)
+            assert len(recs) == 2
+            for r in recs:
+                assert r["Bbar"].abs().max() <= 7
+                assert (r["psum"] is None) == (norm == "fp32")
 
 
 def test_sparse_input_matches_dense():
