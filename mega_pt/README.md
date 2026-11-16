@@ -41,11 +41,20 @@ Unit tests (each test names the equation or Q-ID it checks):
 .venv/bin/python -m pytest -q tests
 ```
 
-One configuration, 10 seeds (the setting that matches Tab.VI on Cora, CiteSeer and PubMed;
-the defaults already select `--norm fold --feat-norm row --x-init mse --clip-refit 10 --lr-bits 2e-2`):
+One configuration, 10 seeds. The defaults select `--norm fold --feat-norm row --x-init mse
+--x-param alpha --clip-refit 0 --lr-bits 2e-2`: α and b are both learned by gradient, as the
+paper states (default since 2026-11-16, Q-04). Best λ so far (3 seeds): 1e-6 for CiteSeer and
+PubMed, 1e-5 for Cora:
 
 ```bash
-.venv/bin/python -m mega_pt.train --dataset citeseer --lam 1e-7 --target-dense-bits 2.0
+.venv/bin/python -m mega_pt.train --dataset citeseer --lam 1e-6 --target-dense-bits 2.0
+```
+
+The earlier MSE re-fit setting (matches Tab.VI at fewer bits, but every degree ends at 2 bits)
+is kept as an option:
+
+```bash
+.venv/bin/python -m mega_pt.train --dataset citeseer --lam 1e-6 --target-dense-bits 2.0 --x-param range --clip-refit 10
 ```
 
 Debug ablation, quantizing only some tensors (here: only the degree-aware features):
@@ -71,10 +80,11 @@ Outputs go to `runs/<name>/`:
 2. **Calibration:** initializes the W/B column scales β, γ (Q-08, Q-09) and each degree's clip
    range (Q-04) from the FP32 model by minimizing quantization MSE (b = 4 for the degree tables). Accuracy right
    after calibration is reported as `ptq_test`, which is useful when debugging initialization.
-3. **QAT:** fine-tunes with `L = CE + λ·(M − M_target)²` (Eq.(4)–(5)). Weights, b, β and γ are
-   learned by gradient. The degree tables' clip ranges are re-fit by MSE at the current
-   rounded b every 10 epochs (`--clip-refit`) and once more at the end. It reports the **last**
-   epoch (`q_test`), so the bits and the accuracy describe the same model.
+3. **QAT:** fine-tunes with `L = CE + λ·(M − M_target)²` (Eq.(4)–(5)). Weights, b, α, β and γ
+   are learned by gradient (Adam). With the option `--clip-refit K`, the degree tables' clip
+   ranges are instead re-fit by MSE at the current rounded b every K epochs and once more at
+   the end. It reports the **last** epoch (`q_test`), so the bits and the accuracy describe
+   the same model.
 
 ## Code map
 
@@ -107,13 +117,14 @@ and the measurement is given.
 |---|---|
 | Scales are learned as log α, log β, log γ | With linear α at Adam lr 0.01, α changed by about 100% per step and QAT accuracy collapsed (q_test ≈ 40%). |
 | `--lsq` (off): LSQ gradient scaling g = 1/sqrt(N·Q_P) on the degree tables' learned scale; `--alpha-opt sgd` to use SGD for it | Tested 2026-11-16 for fidelity (paper cites LSQ [13]). Did not help; see Results log. |
-| Degree tables learn the **clip range** c_d, with α_d = c_d / (2^(round(b_d)−1) − 1) (`--x-param range`, default; added 2026-11-15) | With α learned directly, lowering b at fixed α shrinks the clip range 2× per bit. On Cora's binary features, b 4→2 maps every 1 to α = 1/7, so the task loss blocked bit reduction on layer 0, where 2 bits are lossless. The memory penalty then crushed layer 1 instead (density 10%, q_test ≈ 75–78%). With the clip range, layer 0 goes to 2 bits even without a penalty: Cora λ=0 gives 80.83 ± 0.91 at 2.46 sparse bits, vs 80.57 at 3.80. The forward pass and the stored α are unchanged; this only changes optimization. |
+| **Degree tables learn α_d directly** (`--x-param alpha --clip-refit 0`, default since 2026-11-16) | Fidelity: the paper says the scale is learned (Eq.(2), p.4). The re-fit below matched Tab.VI but every degree ended at 2 bits; learned α keeps degree-varying bits (2–5 in the hidden layer). Cost: CiteSeer 67.8 vs Tab.VI 70.6, Cora 2.58 vs 1.70 bits. See Results log "Fidelity check". |
+| Option: degree tables learn the **clip range** c_d, with α_d = c_d / (2^(round(b_d)−1) − 1) (`--x-param range`; was the default 2026-11-15 → 11-16) | With α learned directly, lowering b at fixed α shrinks the clip range 2× per bit. On Cora's binary features, b 4→2 maps every 1 to α = 1/7, so the task loss blocked bit reduction on layer 0, where 2 bits are lossless. The memory penalty then crushed layer 1 instead (density 10%, q_test ≈ 75–78%). With the clip range, layer 0 goes to 2 bits even without a penalty: Cora λ=0 gives 80.83 ± 0.91 at 2.46 sparse bits, vs 80.57 at 3.80. The forward pass and the stored α are unchanged; this only changes optimization. |
 | **MSE init for the W/B column scales** (`--wb-init mse`, default since 2026-11-16) | NELL: a few hub rows set each B column's max/7, and most entries round to 0. NELL seed 2 PTQ 21.0 → 56.0 (FP32 58.1); NELL QAT λ = 0, 3 seeds: 54.56 ± 9.01 → **58.93 ± 3.50** (FP32 60.85). Neutral on the rest (3 seeds, λ = 1e-6/1e-7): Cora 81.67 → 81.87, CiteSeer 70.33 → 69.93, PubMed 78.97 → 78.93. Amends Q-08/Q-09 init only. |
 | `--lr-bits 2e-2` (default since 2026-11-15) | At 1e-2, b moves about 2 bits in 200 epochs, and the earlier runs ended before the memory converged. |
-| **MSE clip init** for the degree tables (`--x-init mse`, default; added 2026-11-15) | max/7 rounds most entries of heavy-tailed inputs (TF-IDF, hidden ReLU outputs) to 0. PubMed PTQ (before QAT): 73.4 (max) → 79.5 (MSE), with FP32 at 79.1. c_d is picked from 39 fractions of the per-degree max (0.05…1.0) to minimize Σ(x − Q(x))² at b = 4. |
-| **Clip ranges re-fit by MSE, not learned** (`--clip-refit 10`, default; added 2026-11-15) | With 60–140 training nodes the task loss is ~0.05 within 50 QAT epochs, so the learned clip range gets almost no useful gradient. It drifts upward (more values round to 0) and can't follow b when the penalty lowers it: the MSE-best range at 2 bits is far below the 4-bit one. PubMed λ = 1e-7: 57.2 (learned; also 57–62 with lr-alpha 1e-2/3e-2) → **78.17** (re-fit). Re-fitting all tables costs 0.45 s on PubMed. b is still learned (Eq.(5)); only how c is chosen changes, and the hardware still stores one α per degree. |
+| **MSE clip init** for the degree tables (`--x-init mse`, default; added 2026-11-15; applies to α mode too) | max/7 rounds most entries of heavy-tailed inputs (TF-IDF, hidden ReLU outputs) to 0. PubMed PTQ (before QAT): 73.4 (max) → 79.5 (MSE), with FP32 at 79.1. c_d is picked from 39 fractions of the per-degree max (0.05…1.0) to minimize Σ(x − Q(x))² at b = 4. |
+| Option: **clip ranges re-fit by MSE, not learned** (`--clip-refit 10`; was the default 2026-11-15 → 11-16, replaced by learned α for fidelity) | With 60–140 training nodes the task loss is ~0.05 within 50 QAT epochs, so the learned clip range gets almost no useful gradient. It drifts upward (more values round to 0) and can't follow b when the penalty lowers it: the MSE-best range at 2 bits is far below the 4-bit one. PubMed λ = 1e-7: 57.2 (learned; also 57–62 with lr-alpha 1e-2/3e-2) → **78.17** (re-fit). Re-fitting all tables costs 0.45 s on PubMed. b is still learned (Eq.(5)); only how c is chosen changes, and the hardware still stores one α per degree. |
 | M_target at the 2-bit dense floor (`--target-dense-bits 2.0`); λ is the knob | A "reachable" target (`--target-layer-bits 2,2.6`) with a large λ does not act as a clean constraint. Eq.(4) uses continuous b (Q-04), and layer 0's continuous b settles just below 2.5 (it still rounds to 2). With 11× more dimensions, that slack eats the hidden layer's whole budget, so layer 1 collapses to 2 bits (Cora: 75.4%, 0.21 bits). |
-| α learning rate 1e-3 (`--lr-alpha`; unused with `--clip-refit`) | At 1e-2, α drifted upward and the *training* loss rose (0.24 → 1.07; test 79% → 54%). This is consistent with the STE gradient being biased on values that round to 0. At 1e-3 it was stable. |
+| α learning rate 1e-3 (`--lr-alpha`; unused with `--clip-refit`; the α-mode results used it) | At 1e-2, α drifted upward and the *training* loss rose (0.24 → 1.07; test 79% → 54%). This is consistent with the STE gradient being biased on values that round to 0. At 1e-3 it was stable. |
 | QAT weight learning rate 1e-3 (`--lr-qat-weights`) | 1e-2 overfits during the extra 200 epochs: 79.7/78.9 vs 80.4/79.5 test. |
 | Row-normalized input features (`--feat-norm row`, default again since 2026-11-15) | 2026-11-14 we switched to raw features: with max/7 init, row normalization made many layer-0 values round to 0 (Cora QAT 75.9 vs 79.7). With MSE init + re-fit that problem is gone (Cora λ = 1e-7: row 81.77 ± 0.67 vs raw 81.00 ± 0.46, 3 seeds), and row is needed on CiteSeer (FP32 71.4 row vs 68.8 raw, 5 seeds; Tab.VI 71.1). One preprocessing for every dataset is simpler. **Amends Q-14** (back to Kipf's preprocessing). |
 | Dropout after the quantizer | Applying dropout's 1/(1−p) rescale before the quantizer would make the quantizer see different values in training and eval, which biases α. |
@@ -332,16 +343,20 @@ reaches b's gradient directly.
 - vs Tab.VI: PubMed matches (better accuracy, fewer bits). Cora matches in accuracy at λ = 1e-5
   but at 2.58 vs 1.70 bits. CiteSeer is 1–3 points short (PTQ already loses 1.7 of FP32's 71.1;
   QAT loses more).
-- Not changed to default yet: the choice between the two is the user's (fidelity vs matching
-  Tab.VI's accuracy/bits). Reproduce: `--clip-refit 0 --x-param alpha`.
+- **Decision (user, 2026-11-16): learned α is the default** (`--x-param alpha --clip-refit 0`),
+  for fidelity to MEGA as a baseline: the scale is learned as stated, and the per-degree
+  bitwidths stay non-uniform. The re-fit remains available as `--x-param range --clip-refit 10`.
+  Still to do: tune CiteSeer (lr-alpha, λ) and Cora (λ between 1e-5 and 1e-4), then 10-seed runs.
 
 ## Known limitations / next steps
 
 - **b convergence:** Adam moves b by about `--lr-bits` per step, so 200 epochs allow about 2 bits
   of change. With a strong penalty, the memory may still be heading toward M_target at the
   end (check the `mem` log lines). Use more `--epochs-qat` or a higher `--lr-bits` if needed.
-- **λ / M_target sweep (Q-13):** GCN matches Tab.VI on Cora, CiteSeer and PubMed with one
-  setting, λ = 1e-6 and M_target at the 2-bit floor (10 seeds; 2026-11-15 "Quantizer fix").
+- **λ / M_target sweep (Q-13):** with the default learned α (3 seeds, 2026-11-16 "Fidelity
+  check"): PubMed beats Tab.VI at λ = 1e-6, Cora matches its accuracy at λ = 1e-5 but with
+  more bits, CiteSeer is 1–3 points short. Not tuned further yet; no 10-seed runs yet. The
+  MSE re-fit option matched Tab.VI on all three at λ = 1e-6 (10 seeds; 2026-11-15).
 - **Scope:** GCN only. GIN and GraphSage (Q-12) and Reddit are not implemented yet. NELL is
   loaded (sparse X^(0), PyG construction, Tab.II sizes reproduced).
 - **NELL source:** the official hosts are blocked from our cloud environment, so the loader

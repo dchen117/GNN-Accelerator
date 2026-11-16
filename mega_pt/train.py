@@ -4,13 +4,16 @@ Pipeline per seed (Q-14):
   1. FP32 GCN pretraining (Adam, lr 0.01, wd 5e-4, dropout 0.5). Keep the best-val-acc epoch.
   2. Calibrate α/β/γ from the FP32 model (Q-04, Q-08, Q-09). Degree tables: MSE clip init.
   3. Quantization-aware fine-tuning with  L_total = L_task + λ·(M − M_target)²,  Eq.(4)–(5).
-     b is learned; the degree tables' clip ranges are re-fit by MSE every --clip-refit epochs.
+     b and α are both learned by gradient (default --x-param alpha --clip-refit 0, Q-04: the
+     literal Eq.(2) form, chosen 2026-11-16 for fidelity to MEGA). Option: --x-param range
+     --clip-refit 10 re-fits the clip ranges by MSE instead (matches Tab.VI, but uniform 2 bits).
      Reported numbers come from the LAST QAT epoch, so bits and accuracy describe the same
      converged model (best-val selection could pick an epoch before the bits settle).
 
 Examples
   python -m mega_pt.train --dataset cora --seeds 1 --lam 0                       # smoke test
-  python -m mega_pt.train --dataset pubmed --lam 1e-7 --target-dense-bits 2.0    # Tab.VI setting
+  python -m mega_pt.train --dataset pubmed --lam 1e-6 --target-dense-bits 2.0    # Tab.VI setting
+  python -m mega_pt.train --dataset cora --lam 1e-5 --target-dense-bits 2.0      # (Cora needs 1e-5)
   python -m mega_pt.train --dataset cora --norm per_source --frac-bits 6 --lam 1e-7 --target-dense-bits 2.0
 
 Results go to runs/<run-name>/results.json (per-seed metrics, mean/std summary, args) and
@@ -42,19 +45,21 @@ def parse_args(argv=None):
                         "FP32 baseline (71.4 vs 68.8). See README implementation choices")
     p.add_argument("--norm", default="fold", choices=NORM_MODES,
                    help="aggregation normalization mode (Q-11: decided fold)")
-    p.add_argument("--x-param", default="range", choices=["range", "alpha"],
-                   help="how the degree tables learn the scale: clip range c with α = c/q_max(b) "
-                        "(default), or α directly. Same forward pass/hardware; see quant.py")
+    p.add_argument("--x-param", default="alpha", choices=["range", "alpha"],
+                   help="how the degree tables learn the scale: α directly (default, literal "
+                        "Eq.(2)), or clip range c with α = c/q_max(b) (use with --clip-refit). "
+                        "Same forward pass/hardware; see quant.py")
     p.add_argument("--x-init", default="mse", choices=["max", "mse"],
                    help="clip-range init of the degree tables: max|x| per degree, or the grid "
                         "fraction of it that minimizes quantization MSE at 4 bit; see quant.py")
     p.add_argument("--wb-init", default="mse", choices=["max", "mse"],
                    help="init of the 4-bit W/B per-column scales: MSE fit (default, Q-09 amended) "
                         "or max/7 (original Q-08/Q-09)")
-    p.add_argument("--clip-refit", type=int, default=10,
-                   help="K > 0: re-fit the degree tables' clip ranges by MSE at the current "
-                        "rounded b every K QAT epochs, instead of learning them (lr-alpha "
-                        "is then ignored). 0 = learn by gradient. See quant.py refit_clip_")
+    p.add_argument("--clip-refit", type=int, default=0,
+                   help="0 (default) = scales learned by gradient, as the paper states. K > 0: "
+                        "re-fit the degree tables' clip ranges by MSE at the current rounded b "
+                        "every K QAT epochs instead (lr-alpha then ignored; pair with "
+                        "--x-param range). See quant.py refit_clip_")
     p.add_argument("--lsq", action="store_true",
                    help="LSQ gradient scaling g=1/sqrt(N*Q_P) on the degree tables' learned "
                         "scale (only matters with --clip-refit 0, i.e. scales learned by gradient)")

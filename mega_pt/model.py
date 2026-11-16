@@ -101,7 +101,7 @@ class QGCN(nn.Module):
     """
 
     def __init__(self, dims: list[int], max_degree: int, norm: str = "fp32",
-                 frac_bits: int = 8, dropout: float = 0.5, x_param: str = "range"):
+                 frac_bits: int = 8, dropout: float = 0.5, x_param: str = "alpha"):
         super().__init__()
         assert norm in NORM_MODES, norm
         self.dims, self.norm, self.frac_bits, self.dropout = dims, norm, frac_bits, dropout

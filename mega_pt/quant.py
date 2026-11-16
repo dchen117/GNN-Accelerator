@@ -124,17 +124,20 @@ class DegreeAwareQuantizer(nn.Module):
       log_p[d] : log of the learned scale parameter, see `param` below
       bits[d]  : continuous bitwidth b, clamped to [B_MIN, B_MAX]
 
-    param = "range" (default): log_p = log c_d, the clipping range, and
-                α_d = c_d / (2^(round(b_d)−1) − 1).
-            "alpha": log_p = log α_d directly (our first version).
+    param = "alpha" (default since 2026-11-16): log_p = log α_d directly. This is the literal
+                Eq.(2) parameterization ("s" learned), chosen for fidelity to MEGA (Q-04).
+            "range": log_p = log c_d, the clipping range, and α_d = c_d / (2^(round(b_d)−1) − 1).
+                Used with the MSE re-fit (train.py --clip-refit); kept as an option.
     Both give exactly Eq.(2) in the forward pass, and the hardware stores the same thing (one
     α per degree, computed from c and b after training). They differ only in what gradient
     descent sees. With "alpha", lowering b at fixed α shrinks the clip range 2× per bit: on
     Cora's binary features, b 4->2 at α = 1/7 maps every 1 to 1/7, so the task loss resists
     any bit reduction on layer 0 (where 2 bits would be lossless) and the memory penalty
     squeezes the hidden layer instead. With "range", lowering b keeps the range and only
-    coarsens the grid. Measured comparison in mega_pt/README.md. Implementation choice,
-    not from the paper (the paper learns "s" and b, Eq.(2), and does not say how).
+    coarsens the grid. But "range" only works with the MSE re-fit (a gradient-learned c cannot
+    follow b; LSQ does not fix it), and with the re-fit every degree collapsed to 2 bits.
+    "alpha" learned by gradient keeps per-degree bits that differ. Measured comparisons in
+    mega_pt/README.md ("Fidelity check").
 
     Why log space: Adam's step is ~lr in absolute terms. α is often ~0.01, so a linear α
     with lr 0.01 changes ~100% per step and training diverged in our first test. In log
@@ -144,7 +147,7 @@ class DegreeAwareQuantizer(nn.Module):
     used, so it just keeps its initial value.
     """
 
-    def __init__(self, max_degree: int, param: str = "range"):
+    def __init__(self, max_degree: int, param: str = "alpha"):
         super().__init__()
         assert param in ("range", "alpha"), param
         self.param = param

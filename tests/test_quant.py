@@ -184,21 +184,23 @@ def test_mse_init_beats_max_on_heavy_tailed_input():
 def test_refit_clip_follows_bitwidth_and_keeps_sparse_dense_equal():
     """refit_clip_ (--clip-refit): after b drops 4 -> 2, re-fitting the range at the new b must
     lower the error vs keeping the 4-bit range, give the range picked by an MSE init done
-    directly at 2 bits, and treat a sparse input exactly like its dense copy."""
+    directly at 2 bits, and treat a sparse input exactly like its dense copy.
+    Uses param="range", the mode the re-fit is paired with (--x-param range --clip-refit K);
+    the default is "alpha" since 2026-11-16."""
     torch.manual_seed(1)
     x = torch.relu(torch.randn(300, 8)) ** 2
     deg = torch.randint(1, 5, (300,))
-    q = DegreeAwareQuantizer(max_degree=4)
+    q = DegreeAwareQuantizer(max_degree=4, param="range")
     q.init_from_activations(x, deg, "mse")             # fit for b = 4
     with torch.no_grad():
         q.bits.fill_(2.0)
     stale = _mse(q, x, deg)
     q.refit_clip_(x, deg)
     assert _mse(q, x, deg) < stale
-    direct = DegreeAwareQuantizer(max_degree=4)
+    direct = DegreeAwareQuantizer(max_degree=4, param="range")
     direct.init_from_activations(x, deg, "mse", bits=2)
     assert torch.allclose(q.log_p, direct.log_p)
-    qs = DegreeAwareQuantizer(max_degree=4)
+    qs = DegreeAwareQuantizer(max_degree=4, param="range")
     qs.load_state_dict(q.state_dict())
     qs.refit_clip_(x.to_sparse(), deg)
     assert torch.allclose(qs.log_p, q.log_p)

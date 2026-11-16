@@ -104,9 +104,18 @@ should say which kind it is: filling a gap, or departing from a stated detail.
       (`mega_pt/README.md`, "Fidelity check"): LSQ gradient scaling on c does not help (c stays
       near its 4-bit init and cannot follow b). Learning α directly (`--x-param alpha`, no
       re-fit) works: Cora 81.0 @ 2.58 sparse bits (λ 1e-5), CiteSeer 67.8 @ 2.05 (λ 1e-6),
-      PubMed 79.7 @ 1.57 (λ 1e-6), with bits that vary by degree. **Open: user to choose**
-      re-fit (matches Tab.VI, uniform 2 bits) vs α-direct (as stated, degree-varying bits,
-      CiteSeer 1–3 points short, Cora more bits).
+      PubMed 79.7 @ 1.57 (λ 1e-6), with bits that vary by degree.
+  - **Amended 2026-11-16 (user decision): α is learned directly by gradient, no re-fit**
+    (`--x-param alpha --clip-refit 0`, now the default). The MSE clip init stays.
+    - Why: fidelity to MEGA as a baseline. The paper states the scale is learned (Eq.(2),
+      p.4 §III-A), and its key idea is per-degree bitwidths. With the re-fit every degree ended
+      at b = 2, i.e. uniform bits, which removes that idea; learned α keeps bits that vary by
+      degree (2–5 in the hidden layer).
+    - Trade-off: on GCN (3 seeds) CiteSeer is 1–3 points below Tab.VI (67.8 vs 70.6) and Cora
+      needs more bits for Tab.VI accuracy (2.58 vs 1.70); PubMed beats Tab.VI. Not tuned yet.
+      The re-fit stays as an option (`--x-param range --clip-refit 10`) for comparison.
+    - The 2026-11-15 note above (task loss reaches b only via clipping under α-direct) holds
+      again for the default.
 
 ### Q-05 — Gradient through rounding `[PT]` blocking
 - Says: Eq.(2) uses ⌊|x|/α + 0.5⌋ (p.5).
