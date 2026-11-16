@@ -48,6 +48,8 @@ def parse_args(argv=None):
     p.add_argument("--x-init", default="mse", choices=["max", "mse"],
                    help="clip-range init of the degree tables: max|x| per degree, or the grid "
                         "fraction of it that minimizes quantization MSE at 4 bit; see quant.py")
+    p.add_argument("--wb-init", default="max", choices=["max", "mse"],
+                   help="init of the 4-bit W/B per-column scales: max/7 (Q-08/Q-09) or MSE fit")
     p.add_argument("--clip-refit", type=int, default=10,
                    help="K > 0: re-fit the degree tables' clip ranges by MSE at the current "
                         "rounded b every K QAT epochs, instead of learning them (lr-alpha "
@@ -82,6 +84,7 @@ def parse_args(argv=None):
                         "M_target = N·Σ_l dim_l·bits_l/η. Preferred: it makes the target reachable "
                         "(b >= 2), so with a large λ the penalty acts as a memory constraint")
     p.add_argument("--seeds", type=int, default=10, help="number of seeds 0..k-1 (Q-14: 10)")
+    p.add_argument("--seed-start", type=int, default=0, help="first seed (DEBUG: rerun one seed)")
     p.add_argument("--fp32-only", action="store_true", help="stop after FP32 pretraining")
     p.add_argument("--log-every", type=int, default=50)
     p.add_argument("--run-name", default=None)
@@ -175,7 +178,7 @@ def main(argv=None):
     os.makedirs(out_dir, exist_ok=True)
 
     per_seed = []
-    for seed in range(args.seeds):
+    for seed in range(args.seed_start, args.seed_start + args.seeds):
         t0 = time.time()
         torch.manual_seed(seed)
         model = QGCN(dims, int(g.deg.max()), norm=args.norm, frac_bits=args.frac_bits, dropout=args.dropout,
@@ -184,7 +187,8 @@ def main(argv=None):
         row = {"seed": seed, "fp32_test": fp32_test, "fp32_val": fp32_val}
         if not args.fp32_only:
             model.calibrate(g.x, ops, args.x_init,
-                            [float(v) for v in args.x_init_bits.split(",")] if args.x_init_bits else None)
+                            [float(v) for v in args.x_init_bits.split(",")] if args.x_init_bits else None,
+                            args.wb_init)
             model.quantize = True
             model.quant_parts = args.quant_parts
             model.eval()

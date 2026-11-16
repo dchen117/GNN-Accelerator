@@ -253,9 +253,23 @@ class ColumnQuantizer(nn.Module):
         return self.log_scale.exp()
 
     @torch.no_grad()
-    def init_from_tensor(self, t: torch.Tensor) -> None:
-        """Q-08/Q-09 init: per-column max|t| / Q_max."""
-        self.log_scale.copy_((t.abs().amax(dim=0).clamp_min(EPS) / self.qmax).log())
+    def init_from_tensor(self, t: torch.Tensor, method: str = "max") -> None:
+        """Q-08/Q-09 init of the per-column scale.
+
+        method = "max": max|t| / Q_max per column (nothing clipped). The Q-08/Q-09 decision.
+        method = "mse": the fraction of that max (R_GRID) minimizing Σ (t − Q(t))² per
+                 column, same search as the degree tables' "mse" init. Added for NELL, where
+                 a few large entries per column (hub rows of B) set max/7 and most entries
+                 round to 0. Measured in mega_pt/README.md. Implementation choice.
+        """
+        assert method in ("max", "mse"), method
+        cmax = t.abs().amax(dim=0).clamp_min(EPS)
+        if method == "mse":
+            rows, cols = t.nonzero(as_tuple=True)
+            vals = t[rows, cols].abs()
+            groups = torch.arange(cmax.numel())          # each column is its own group
+            cmax = _mse_clip(cols, vals, groups, cmax, self.qmax.expand_as(cmax))
+        self.log_scale.copy_((cmax / self.qmax).log())
 
     @torch.no_grad()
     def clamp_(self) -> None:

@@ -85,6 +85,7 @@ Outputs go to `runs/<name>/`:
 | `model.py` | `QGCN` and `GraphOps`. The three normalization modes (Q-11) are described in the module docstring |
 | `metrics.py` | Accuracy, average-bits definitions (Q-15), memory, partial-sum / lost-B checks |
 | `train.py` | CLI: pretraining → calibration → QAT, multiple seeds, results JSON |
+| `ptq_frontier.py` | Debug: PTQ accuracy vs fixed per-layer bitwidth (no QAT), MSE clip per b |
 
 ## Metrics in `results.json`
 
@@ -155,7 +156,8 @@ at 2 bits in every run (lossless for binary features).
 Before the clip-range fix (`--x-param alpha`), the same sweep gave 78.4–79.6%. Each fix is
 documented in "Implementation choices" above.
 
-**CiteSeer and PubMed: not matched yet (open).** Both lose about 3 points to QAT *even with
+**CiteSeer and PubMed: not matched yet with the recipe of that day** (resolved later the same day,
+see "Quantizer fix" below). Both lost about 3 points to QAT *even with
 λ = 0*, and the memory penalty is far more sensitive than on Cora.
 
 | Dataset (FP32 ours / Tab.VI) | Setting | q_test (%) | avg_bits_sparse |
@@ -183,8 +185,8 @@ Diagnosis so far:
 - **Feature preprocessing matters on CiteSeer.** FP32 is 68.8 raw vs 71.4 row-normalized
   (5 seeds; Tab.VI: 71.1). The "raw features" choice above was measured on Cora only, and under
   the old α parameterization.
-- Next things to try: better X initialization than max/7 (e.g. MSE- or percentile-based
-  clip), longer QAT at a lower bits learning rate, and Eq.(4) normalized per layer.
+- Next things to try (done, see below): better X initialization than max/7 (e.g. MSE- or
+  percentile-based clip), longer QAT at a lower bits learning rate, and Eq.(4) normalized per layer.
 
 ### 2026-11-15 — Q-11 normalization comparison on NELL, 3 seeds, λ = 0
 
@@ -212,13 +214,62 @@ recipe gets only 57.2% FP32 on NELL; see Q-14). NELL's maximum degree is 4,550, 
   QAT losses even at λ = 0.
 - Per-seed time: about 22 minutes with 3 jobs in parallel on 4 CPUs.
 
+### 2026-11-15 — Quantizer fix: MSE clip init + MSE re-fit (Q-04 amended); Tab.VI matched
+
+**Final, 10 seeds, current defaults** (`--norm fold --feat-norm row --x-init mse --clip-refit 10
+--lr-bits 2e-2`, M_target at the 2-bit dense floor, 200 QAT epochs). avg bits = `avg_bits_sparse`.
+
+| Dataset | FP32 (ours) | λ = 1e-7 | λ = 1e-6 | Tab.VI |
+|---|---|---|---|---|
+| Cora | 81.65 ± 0.46 | 81.70 ± 0.61 @ 1.99 | **81.67 ± 0.40 @ 1.08** | 80.9 ± 0.6 @ 1.70 |
+| CiteSeer | 71.23 ± 0.54 | 70.59 ± 0.80 @ 1.27 | **70.35 ± 0.69 @ 0.97** | 70.6 ± 1.1 @ 1.87 |
+| PubMed | 78.99 ± 0.60 | 79.05 ± 0.86 @ 0.88 | **78.97 ± 0.57 @ 0.85** | 78.3 ± 0.6 @ 2.50 |
+
+λ = 1e-6 meets the acceptance check on all three (accuracy within the paper's std, at fewer
+bits). At λ = 1e-7 Cora's accuracy matches but its bits (1.99) are above 1.70.
+
+**Observation (not a decision):** at λ = 1e-6 every degree entry in both layers ends at b = 2
+(L0 and L1 mean b = 2.00). The degree-aware part that remains is the per-degree α (clip range).
+So on these three datasets a single 2-bit width plus a per-degree scale reaches Tab.VI accuracy.
+Whether this argues for dropping per-degree bitwidths in hardware is open: it should be checked
+on GIN/GraphSage and Reddit first, and the paper's Fig.10 shows non-uniform bits.
+
+**How we got there** (3 seeds unless noted, fold, λ = 0 unless noted):
+
+1. **Max-based init was the PTQ loss.** max/7 rounds most heavy-tailed entries to 0.
+   PubMed PTQ (accuracy right after calibration): 73.4 → **79.5** with MSE init (FP32 79.1).
+   PubMed QAT λ = 0: 75.93 → 78.00. Cora unchanged (81.07). CiteSeer raw 67.37 → 67.87.
+2. **Low bits are not the problem.** PTQ only, all degrees at a fixed b, MSE clip per b
+   (`python -m mega_pt.ptq_frontier`, 2 seeds; raw PubMed): PubMed (4,2) bits 78.7 at 0.95 sparse bits, (2,2) 77.2 at 0.54;
+   CiteSeer row (2,3) 71.2 at 2.34, (2,2) 67.9 at 1.21. Yet QAT with λ = 1e-7 collapsed
+   PubMed to 57.2 at (2.2, 2.1) bits.
+3. **The learned clip range was what broke QAT.** With b frozen (`--lr-bits 0`) at (2,2),
+   PubMed QAT fell from 77.4 to 71.9 and sparse bits dropped 0.54 → 0.31: the range grew and
+   zeroed more of the hidden layer. Freezing the range too (`--lr-alpha 0`): PubMed (4,2)
+   78.97, CiteSeer row (2,3) 70.93, Cora (2,2) 80.40. A higher range lr did not help
+   (PubMed λ = 1e-7 with lr-alpha 1e-2 / 3e-2: 62.0 / 59.3).
+4. **Fix: re-fit the range by MSE at the current round(b)** every 10 epochs instead of learning
+   it. b keeps learning (Eq.(5)), and the range now follows it:
+
+| Setting (3 seeds) | Before (learned range) | After (`--clip-refit 10`) |
+|---|---|---|
+| PubMed raw, λ = 0 | 78.00 @ 1.94 | 78.97 ± 0.60 @ 3.17 |
+| PubMed raw, λ = 1e-7 | 57.20 @ 0.21 | **78.17 ± 0.40 @ 0.89** |
+| PubMed row, λ = 1e-7 | — | 78.97 ± 1.27 @ 0.89 |
+| CiteSeer row, λ = 0 | 69.77 @ 3.79 | 71.00 ± 0.46 @ 4.17 |
+| CiteSeer row, λ = 1e-7 | 48.70 @ 0.35 | **70.33 ± 1.40 @ 1.32** |
+| Cora raw, λ = 1e-7 | 81.00 @ 1.60 | 81.00 ± 0.46 @ 1.34 |
+| Cora row, λ = 1e-7 | — | 81.77 ± 0.67 @ 1.99 |
+
+5. **Row normalization is fine again**, so it is the default for every dataset (Q-14 amended).
+
 ## Known limitations / next steps
 
 - **b convergence:** Adam moves b by about `--lr-bits` per step, so 200 epochs allow about 2 bits
   of change. With a strong penalty, the memory may still be heading toward M_target at the
   end (check the `mem` log lines). Use more `--epochs-qat` or a higher `--lr-bits` if needed.
-- **λ / M_target sweep (Q-13):** Cora matches Tab.VI (λ = 1e-7). CiteSeer and PubMed do not yet
-  (see the 2026-11-15 results log).
+- **λ / M_target sweep (Q-13):** GCN matches Tab.VI on Cora, CiteSeer and PubMed with one
+  setting, λ = 1e-6 and M_target at the 2-bit floor (10 seeds; 2026-11-15 "Quantizer fix").
 - **Scope:** GCN only. GIN and GraphSage (Q-12) and Reddit are not implemented yet. NELL is
   loaded (sparse X^(0), PyG construction, Tab.II sizes reproduced).
 - **NELL source:** the official hosts are blocked from our cloud environment, so the loader

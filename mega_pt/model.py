@@ -231,7 +231,7 @@ class QGCN(nn.Module):
     # ------------------------------------------------------------------ init
     @torch.no_grad()
     def calibrate(self, x: torch.Tensor, ops: GraphOps, x_init: str = "max",
-                  init_bits: list[float] | None = None) -> None:
+                  init_bits: list[float] | None = None, wb_init: str = "max") -> None:
         """Initialize all scales from one FP32 eval pass (Q-04, Q-08, Q-09).
 
         Runs the FP32 network layer by layer and initializes, per layer:
@@ -240,6 +240,7 @@ class QGCN(nn.Module):
         x_init: "max" or "mse" clip-range init for the α tables (see
           DegreeAwareQuantizer.init_from_activations).
         init_bits: starting bitwidth per layer (all degrees); default B_INIT everywhere.
+        wb_init: "max" or "mse" init for the W and B column scales (ColumnQuantizer).
         """
         was_training, was_quant = self.training, self.quantize
         self.eval()
@@ -248,10 +249,10 @@ class QGCN(nn.Module):
         for l in range(L):
             self.x_quant[l].init_from_activations(x, ops.deg, x_init,
                                                  bits=init_bits[l] if init_bits else B_INIT)
-            self.w_quant[l].init_from_tensor(self.weights[l])
+            self.w_quant[l].init_from_tensor(self.weights[l], wb_init)
             B = _matmul(x, self.weights[l])
             B_seen = ops.dinv_sqrt.unsqueeze(1) * B if self.norm == "fold" else B
-            self.b_quant[l].init_from_tensor(B_seen)
+            self.b_quant[l].init_from_tensor(B_seen, wb_init)
             x = torch.sparse.mm(ops.a_norm, B)
             if l < L - 1:
                 x = F.relu(x)
