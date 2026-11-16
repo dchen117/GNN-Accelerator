@@ -48,8 +48,9 @@ def parse_args(argv=None):
     p.add_argument("--x-init", default="mse", choices=["max", "mse"],
                    help="clip-range init of the degree tables: max|x| per degree, or the grid "
                         "fraction of it that minimizes quantization MSE at 4 bit; see quant.py")
-    p.add_argument("--wb-init", default="max", choices=["max", "mse"],
-                   help="init of the 4-bit W/B per-column scales: max/7 (Q-08/Q-09) or MSE fit")
+    p.add_argument("--wb-init", default="mse", choices=["max", "mse"],
+                   help="init of the 4-bit W/B per-column scales: MSE fit (default, Q-09 amended) "
+                        "or max/7 (original Q-08/Q-09)")
     p.add_argument("--clip-refit", type=int, default=10,
                    help="K > 0: re-fit the degree tables' clip ranges by MSE at the current "
                         "rounded b every K QAT epochs, instead of learning them (lr-alpha "

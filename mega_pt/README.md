@@ -68,8 +68,8 @@ Outputs go to `runs/<name>/`:
 
 1. **FP32 pretraining:** a plain 2-layer GCN, hidden 128, no bias. It keeps the epoch with the
    best validation accuracy. This gives the `fp32_test` column.
-2. **Calibration:** initializes β and γ from the FP32 model using max/7 (Q-08, Q-09), and each
-   degree's clip range by minimizing quantization MSE at b = 4 (Q-04, amended). Accuracy right
+2. **Calibration:** initializes the W/B column scales β, γ (Q-08, Q-09) and each degree's clip
+   range (Q-04) from the FP32 model by minimizing quantization MSE (b = 4 for the degree tables). Accuracy right
    after calibration is reported as `ptq_test`, which is useful when debugging initialization.
 3. **QAT:** fine-tunes with `L = CE + λ·(M − M_target)²` (Eq.(4)–(5)). Weights, b, β and γ are
    learned by gradient. The degree tables' clip ranges are re-fit by MSE at the current
@@ -107,6 +107,7 @@ and the measurement is given.
 |---|---|
 | Scales are learned as log α, log β, log γ | With linear α at Adam lr 0.01, α changed by about 100% per step and QAT accuracy collapsed (q_test ≈ 40%). |
 | Degree tables learn the **clip range** c_d, with α_d = c_d / (2^(round(b_d)−1) − 1) (`--x-param range`, default; added 2026-11-15) | With α learned directly, lowering b at fixed α shrinks the clip range 2× per bit. On Cora's binary features, b 4→2 maps every 1 to α = 1/7, so the task loss blocked bit reduction on layer 0, where 2 bits are lossless. The memory penalty then crushed layer 1 instead (density 10%, q_test ≈ 75–78%). With the clip range, layer 0 goes to 2 bits even without a penalty: Cora λ=0 gives 80.83 ± 0.91 at 2.46 sparse bits, vs 80.57 at 3.80. The forward pass and the stored α are unchanged; this only changes optimization. |
+| **MSE init for the W/B column scales** (`--wb-init mse`, default since 2026-11-16) | NELL: a few hub rows set each B column's max/7, and most entries round to 0. NELL seed 2 PTQ 21.0 → 56.0 (FP32 58.1); NELL QAT λ = 0, 3 seeds: 54.56 ± 9.01 → **58.93 ± 3.50** (FP32 60.85). Neutral on the rest (3 seeds, λ = 1e-6/1e-7): Cora 81.67 → 81.87, CiteSeer 70.33 → 69.93, PubMed 78.97 → 78.93. Amends Q-08/Q-09 init only. |
 | `--lr-bits 2e-2` (default since 2026-11-15) | At 1e-2, b moves about 2 bits in 200 epochs, and the earlier runs ended before the memory converged. |
 | **MSE clip init** for the degree tables (`--x-init mse`, default; added 2026-11-15) | max/7 rounds most entries of heavy-tailed inputs (TF-IDF, hidden ReLU outputs) to 0. PubMed PTQ (before QAT): 73.4 (max) → 79.5 (MSE), with FP32 at 79.1. c_d is picked from 39 fractions of the per-degree max (0.05…1.0) to minimize Σ(x − Q(x))² at b = 4. |
 | **Clip ranges re-fit by MSE, not learned** (`--clip-refit 10`, default; added 2026-11-15) | With 60–140 training nodes the task loss is ~0.05 within 50 QAT epochs, so the learned clip range gets almost no useful gradient. It drifts upward (more values round to 0) and can't follow b when the penalty lowers it: the MSE-best range at 2 bits is far below the 4-bit one. PubMed λ = 1e-7: 57.2 (learned; also 57–62 with lr-alpha 1e-2/3e-2) → **78.17** (re-fit). Re-fitting all tables costs 0.45 s on PubMed. b is still learned (Eq.(5)); only how c is chosen changes, and the hardware still stores one α per degree. |
@@ -210,14 +211,15 @@ recipe gets only 57.2% FP32 on NELL; see Q-14). NELL's maximum degree is 4,550, 
   interpretation, not tested: with unscaled B, hub rows set the per-column γ, and the
   1/√d fold shrinks them so γ fits typical rows.
 - **Seed 2 is unstable in every mode.** PTQ (before QAT) drops to 21–39%, and QAT recovers
-  only part of it. NELL QAT is affected by the same open problem as CiteSeer and PubMed:
-  QAT losses even at λ = 0.
+  only part of it. Mostly fixed by MSE init of the W/B column scales (2026-11-16 below).
 - Per-seed time: about 22 minutes with 3 jobs in parallel on 4 CPUs.
 
 ### 2026-11-15 — Quantizer fix: MSE clip init + MSE re-fit (Q-04 amended); Tab.VI matched
 
-**Final, 10 seeds, current defaults** (`--norm fold --feat-norm row --x-init mse --clip-refit 10
---lr-bits 2e-2`, M_target at the 2-bit dense floor, 200 QAT epochs). avg bits = `avg_bits_sparse`.
+**Final, 10 seeds** (`--norm fold --feat-norm row --x-init mse --clip-refit 10 --lr-bits 2e-2
+--wb-init max`, M_target at the 2-bit dense floor, 200 QAT epochs). avg bits = `avg_bits_sparse`.
+These runs predate the `--wb-init mse` default (2026-11-16); the 3-seed checks of that change
+are in "Implementation choices" and are neutral on these datasets.
 
 | Dataset | FP32 (ours) | λ = 1e-7 | λ = 1e-6 | Tab.VI |
 |---|---|---|---|---|
@@ -262,6 +264,25 @@ on GIN/GraphSage and Reddit first, and the paper's Fig.10 shows non-uniform bits
 | Cora row, λ = 1e-7 | — | 81.77 ± 0.67 @ 1.99 |
 
 5. **Row normalization is fine again**, so it is the default for every dataset (Q-14 amended).
+
+### 2026-11-16 — NELL with the quantizer fix, 3 seeds, λ = 0
+
+Same NELL recipe as the Q-11 comparison above (`--dropout 0.1 --wd 1e-5 --epochs-fp32 400`),
+now with the defaults `--x-init mse --clip-refit 10 --feat-norm row --norm fold`.
+
+| W/B init | Per-seed q_test (%) | Mean q_test | Sparse bits |
+|---|---|---|---|
+| max/7 (Q-09 as first decided) | 59.3 / 60.2 / 44.2 | 54.56 ± 9.01 | 1.24 |
+| **MSE (`--wb-init mse`)** | **60.7 / 61.2 / 54.9** | **58.93 ± 3.50** | 1.53 |
+
+FP32: 62.5 / 61.9 / 58.1 (60.85 ± 2.40).
+- The degree-aware X tables alone were not NELL's problem: seed 2, PTQ only, quantizing X only
+  gives 56.9 (FP32 58.1), but W+B only gives 48.2 and everything 21.0 (`--quant-parts`,
+  `--epochs-qat 0 --seed-start 2`). MSE W/B init brings "everything" to 56.0.
+- Still open: seed 2 loses ~3 points in QAT, and an MSE re-fit of the clip ranges *right after
+  calibration* (0 QAT epochs) dropped seed 2 from 56.0 to 44.9 — on NELL's 186 classes, MSE on
+  the hidden layer seems to be a weaker proxy than on the other datasets. Not investigated
+  further; NELL has no GCN accuracy in Tab.VI.
 
 ## Known limitations / next steps
 

@@ -156,6 +156,14 @@ The paper is never "corrected" here. Possible readings are listed but not chosen
   Combination Buffer and Sparse Buffer.** (2026-11-14)
   - Why: "quantize B as the quantization way of W" (p.5) and "quantized to 4bit" (p.7).
   - Trade-off: one requantization point; the per-column γ must be stored with the weights.
+  - **Amended 2026-11-16 (init only; applies to β of Q-08 too):** γ and β are initialized by MSE
+    (the fraction of max|col| that minimizes Σ(t − Q(t))² per column) instead of max/7
+    (`--wb-init mse`, default). Still learned by gradient during QAT.
+    - Why: on NELL a few large entries per column (hub rows) set max/7 and most entries round to
+      0. NELL seed 2 PTQ: 21.0 → 56.0 (FP32 58.1); NELL QAT λ = 0: 54.56 ± 9.01 → 58.93 ± 3.50.
+      Neutral elsewhere (3 seeds): Cora 81.67 → 81.87, CiteSeer 70.33 → 69.93, PubMed
+      78.97 → 78.93.
+    - Trade-off: none in hardware (one scale per column either way). Old: `--wb-init max`.
 
 ### Q-10 — First-layer input and last-layer output `[PT][SIM]` blocking
 - Says: X in XW is "obtained from the aggregation phase of the previous layer" (p.5). The
