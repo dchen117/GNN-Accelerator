@@ -263,6 +263,22 @@ should say which kind it is: filling a gap, or departing from a stated detail.
   - Why: fits Eq.(1)'s single-W form and one combination pass per layer.
   - Trade-off: differs from the original GIN (MLP, learnable ε) and GraphSage (separate self
     weight, concat); accuracy may differ from those models.
+  - **Implemented 2026-11-16** (`mega_pt/model.py` GraphOps, `--model gin|sage`). Choices the
+    paper does not state, made here (ours):
+    - One layer form for all three: Ã = diag(t)·(A+I)·diag(s). GIN: s = t = 1. GraphSage:
+      s = 1, t = 1/d. So under the decided `fold` mode (Q-11) GIN and GraphSage need no
+      source scaling, and GraphSage's 1/d sits in the Encoder's per-degree scale, as
+      the Q-11 shared-design note planned.
+    - Sampling: uniform, without replacement, at most 25 in-neighbors per node, plus the
+      self-loop, which is always kept. One sampled graph is shared by both layers, because
+      the hardware stores one CSC graph. Training draws a new sample every epoch (standard
+      GraphSage). Evaluation, calibration and metrics use one fixed sample seeded by the run
+      seed.
+    - Degree under sampling: the **sampled** in-degree incl. self-loop (≤ 26). The hardware
+      only sees the stored, sampled graph, so that is the degree its tables can be indexed
+      by. Degree tables therefore have 27 entries for GraphSage.
+    - Hidden size from Tab.III: 128 for GIN, 256 for GraphSage. The training recipe is the
+      same as GCN (Q-14).
 
 ### Q-13 — Loss hyperparameters `[PT]` blocking
 - Says: Eq.(4)–(5), η = 8·1024 (p.5). λ is tuned to trade accuracy for size; e.g. lower λ gives

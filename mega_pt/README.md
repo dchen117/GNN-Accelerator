@@ -1,4 +1,4 @@
-# mega_pt — PyTorch model of MEGA's Degree-Aware quantization (GCN)
+# mega_pt — PyTorch model of MEGA's Degree-Aware quantization (GCN, GIN, GraphSage)
 
 A "fake-quant" PyTorch model of MEGA's algorithm (HPCA 2024, arXiv:2311.09775). It
 reproduces the accuracy and average-bits numbers in Tab.VI, and it measures the
@@ -50,6 +50,20 @@ PubMed, 1e-5 for Cora:
 .venv/bin/python -m mega_pt.train --dataset citeseer --lam 1e-6 --target-dense-bits 2.0
 ```
 
+GIN and GraphSage (Q-12; Tab.III hidden sizes 128 / 256 are the defaults):
+
+```bash
+.venv/bin/python -m mega_pt.train --model gin --dataset citeseer --lam 1e-6 --target-dense-bits 2.0
+```
+
+```bash
+.venv/bin/python -m mega_pt.train --model sage --dataset cora --lam 1e-6 --target-dense-bits 2.0
+```
+
+All three use Eq.(1)'s single-W layer and differ only in Ã: GIN-0 sums over A+I, GraphSage
+averages over the node plus 25 sampled in-neighbors (`--samples`). GraphSage draws a new
+sample every training epoch and evaluates on one fixed sample seeded by the run seed.
+
 The earlier MSE re-fit setting (matches Tab.VI at fewer bits, but every degree ends at 2 bits)
 is kept as an option:
 
@@ -92,7 +106,7 @@ Outputs go to `runs/<name>/`:
 |---|---|
 | `data.py` | Planetoid loader (Cora/CiteSeer/PubMed/NELL) with a whitelist unpickler. Public split, self-loops, in-degree (Q-01, Q-14). NELL's X^(0) is sparse |
 | `quant.py` | Eq.(2) quantizer with STE, the degree-indexed (α, b) table, 4-bit column quantizer, Q1.f fixed point |
-| `model.py` | `QGCN` and `GraphOps`. The three normalization modes (Q-11) are described in the module docstring |
+| `model.py` | `QGCN` (the Eq.(1) layer for all three models) and `GraphOps` (Ã per model, GraphSage neighbor sampling, Q-12). The three normalization modes (Q-11) are described in the module docstring |
 | `metrics.py` | Accuracy, average-bits definitions (Q-15), memory, partial-sum / lost-B checks |
 | `train.py` | CLI: pretraining → calibration → QAT, multiple seeds, results JSON |
 | `ptq_frontier.py` | Debug: PTQ accuracy vs fixed per-layer bitwidth (no QAT), MSE clip per b |
@@ -348,6 +362,35 @@ reaches b's gradient directly.
   bitwidths stay non-uniform. The re-fit remains available as `--x-param range --clip-refit 10`.
   Still to do: tune CiteSeer (lr-alpha, λ) and Cora (λ between 1e-5 and 1e-4), then 10-seed runs.
 
+### 2026-11-16 — GIN and GraphSage (Q-12), first results
+
+Default settings (learned α, MSE init, fold, row features, 200 + 200 epochs), M_target at the
+2-bit dense floor, 3 seeds (0–2), no λ tuning beyond the grid below. GIN = GIN-0 with one
+linear layer and sum over A+I, hidden 128. GraphSage = mean over self + 25 sampled
+neighbors with a single W, hidden 256. q_test %, avg bits = `avg_bits_sparse`:
+
+| Model / dataset | FP32 (ours) | PTQ | λ = 0 | λ = 1e-7 | λ = 1e-6 | λ = 1e-5 | Tab.VI |
+|---|---|---|---|---|---|---|---|
+| GIN Cora | 78.07 ± 1.87 | 75.67 | 76.73 @ 3.73 | 77.13 @ 3.29 | 76.80 @ 2.91 | **76.63 ± 0.12 @ 1.92** | 77.8 ± 1.6 @ 2.37 (FP32 77.6) |
+| GIN CiteSeer | 67.83 ± 0.06 | 62.63 | 63.87 @ 4.29 | 61.67 @ 2.82 | 59.80 @ 2.22 | **65.33 ± 0.90 @ 1.57** | 65.1 ± 1.7 @ 2.54 (FP32 66.1) |
+| GraphSage Cora | 81.70 ± 0.17 | 82.07 | 81.63 @ 4.61 | 81.97 @ 4.14 | 81.57 @ 3.60 | **81.53 ± 0.71 @ 1.81** | 79.7 ± 1.0 @ 3.40 (FP32 79.7) |
+
+- **λ = 1e-5 meets the acceptance check on all three rows**: accuracy within Tab.VI's std
+  at fewer bits. GIN Cora is 1.2 below the paper's mean (inside its ±1.6).
+- **Per-degree bits stay non-uniform** in the hidden layer (seed 0, λ = 1e-5, layer 1,
+  degrees 1–15): GIN Cora 4,3,4,4,4,3,4,4,4,2,4,4,4,3,3; GIN CiteSeer 2–3; GraphSage Cora
+  3–4. Layer 0 (binary / row-normalized input) goes to 2 bits except degree 1.
+- **GIN CiteSeer is the hard case, as in the paper.** PTQ at 4 bits already loses 5.2
+  points (Tab.I: DQ-INT4 loses 5.3). Accuracy is not monotonic in λ (λ = 1e-6 is worst,
+  59.8). We have not investigated this; with 3 seeds it may partly be noise.
+- **GraphSage FP32 is 2 points above Tab.VI** (81.7 vs 79.7). Our GraphSage is the Q-12
+  single-W simplification, without the separate self weight or the concat. That could
+  explain the gap, but we have not tested it. Quantized accuracy matches our own FP32.
+- Integer partial sums stay far below 16-bit: max |psum| is 479 (GIN, sum aggregation)
+  and 148 (GraphSage).
+- Not run: 10 seeds, GIN PubMed and GraphSage CiteSeer/PubMed (not in Tab.VI), Reddit
+  (blocked).
+
 ## Known limitations / next steps
 
 - **b convergence:** Adam moves b by about `--lr-bits` per step, so 200 epochs allow about 2 bits
@@ -357,8 +400,8 @@ reaches b's gradient directly.
   check"): PubMed beats Tab.VI at λ = 1e-6, Cora matches its accuracy at λ = 1e-5 but with
   more bits, CiteSeer is 1–3 points short. Not tuned further yet; no 10-seed runs yet. The
   MSE re-fit option matched Tab.VI on all three at λ = 1e-6 (10 seeds; 2026-11-15).
-- **Scope:** GCN only. GIN and GraphSage (Q-12) and Reddit are not implemented yet. NELL is
-  loaded (sparse X^(0), PyG construction, Tab.II sizes reproduced).
+- **Scope:** GCN, GIN and GraphSage (Q-12). Reddit is not loaded yet (download host
+  blocked). NELL is loaded (sparse X^(0), PyG construction, Tab.II sizes reproduced).
 - **NELL source:** the official hosts are blocked from our cloud environment, so the loader
   fetches a GitHub LFS mirror and verifies each file's sha256 (see `data.py`).
 - **Scales treated as exact:** the scale multiplications (α·β, γ, d^(−1/2)) are assumed
