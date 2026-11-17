@@ -37,7 +37,7 @@ import time
 import torch
 import torch.nn.functional as F
 
-from .data import load_dataset
+from .data import DATASETS, DEFAULT_FEAT_NORM, load_dataset
 from .metrics import accuracy, quant_report
 from .model import ETA, MODELS, NORM_MODES, GraphOps, QGCN
 
@@ -49,11 +49,18 @@ def parse_args(argv=None):
                         "sage = GraphSage-mean over self + sampled neighbors, single W")
     p.add_argument("--samples", type=int, default=25,
                    help="GraphSage neighbors sampled per node (Tab.III: 25); ignored otherwise")
-    p.add_argument("--dataset", default="cora", choices=["cora", "citeseer", "pubmed", "nell"])
-    p.add_argument("--feat-norm", default="row", choices=["row", "none"],
-                   help="input preprocessing: row-normalize X (Kipf's GCN preprocessing; default) "
-                        "or raw. With --x-init mse both work on Cora; row is needed for CiteSeer's "
-                        "FP32 baseline (71.4 vs 68.8). See README implementation choices")
+    p.add_argument("--dataset", default="cora", choices=DATASETS,
+                   help="MEGA's sets (cora/citeseer/pubmed/nell/reddit) or our extra evaluation "
+                        "sets (docs/beyond-mega/01-extra-datasets.md). Datasets with several "
+                        "published splits (roman-empire, amazon-ratings: 10) run seed s on split s%%10")
+    p.add_argument("--feat-norm", default=None, choices=["row", "std", "none"],
+                   help="input preprocessing; default per dataset (data.DEFAULT_FEAT_NORM): row = "
+                        "row-normalize (Kipf; MEGA's bag-of-words sets, Q-14), std = per-column "
+                        "z-score (embedding / mixed-unit features), none = raw (Reddit ships "
+                        "already standardized). See README implementation choices")
+    p.add_argument("--inductive", default=None, choices=["on", "off"],
+                   help="train on the graph induced by the training nodes only (GraphSAGE's Reddit "
+                        "protocol, Q-14); evaluate on the full graph. Default: on for reddit only")
     p.add_argument("--norm", default="fold", choices=NORM_MODES,
                    help="aggregation normalization mode (Q-11: decided fold)")
     p.add_argument("--x-param", default="alpha", choices=["range", "alpha"],
@@ -111,6 +118,11 @@ def parse_args(argv=None):
     p.add_argument("--seeds", type=int, default=10, help="number of seeds 0..k-1 (Q-14: 10)")
     p.add_argument("--seed-start", type=int, default=0, help="first seed (DEBUG: rerun one seed)")
     p.add_argument("--fp32-only", action="store_true", help="stop after FP32 pretraining")
+    p.add_argument("--fp32-cache", default=None,
+                   help="directory to save / reuse the FP32-pretrained model per seed (keyed by "
+                        "every argument that affects pretraining). Saves the ~20 min/seed "
+                        "pretraining on Reddit when sweeping λ. The RNG states are saved too, so a "
+                        "cached run continues exactly like an uncached one")
     p.add_argument("--log-every", type=int, default=50)
     p.add_argument("--run-name", default=None)
     p.add_argument("--out-dir", default="runs")
@@ -170,7 +182,11 @@ def train_qat(model, g, ops, args, m_target_kb, train_ops):
         step_ops = train_ops()
         logits = model(g.x, step_ops)
         task = F.cross_entropy(logits[g.train_idx], g.y[g.train_idx])
-        mem = model.memory_kb(step_ops.deg)                   # Eq.(4) inner term, KB
+        # Eq.(4) inner term, KB. Degrees of the graph this step runs on, except in inductive
+        # mode: there val/test nodes are isolated in the training graph (degree 1), which would
+        # misstate the memory of the graph the hardware actually stores, so count the
+        # evaluation graph instead (for GraphSage: the fixed evaluation sample).
+        mem = model.memory_kb(ops.deg if args.inductive == "on" else step_ops.deg)
         penalty = (mem - m_target_kb) ** 2 if args.lam > 0 else torch.zeros(())
         loss = task + args.lam * penalty                      # Eq.(5)
         loss.backward()
@@ -187,6 +203,20 @@ def train_qat(model, g, ops, args, m_target_kb, train_ops):
         model.refit_clips_(g.x, ops)   # final ranges match the final b and weights
 
 
+# Arguments that change FP32 pretraining; the cache key must include all of them.
+FP32_KEYS = ("model", "dataset", "feat_norm", "inductive", "samples", "hidden", "dropout", "lr",
+             "wd", "epochs_fp32", "norm", "frac_bits", "x_param")
+
+
+def _fp32_cache_path(args, seed: int):
+    if not args.fp32_cache:
+        return None
+    key = "_".join(f"{k}={getattr(args, k)}" for k in FP32_KEYS)
+    import hashlib
+    return os.path.join(args.fp32_cache, f"{args.model}_{args.dataset}_s{seed}_"
+                        f"{hashlib.sha1(key.encode()).hexdigest()[:10]}.pt")
+
+
 def bit_tables(model) -> dict:
     return {f"layer{l}": {"bits": q.bits.detach().tolist(), "scale": q.scale.detach().tolist()}
             for l, q in enumerate(model.x_quant)}
@@ -194,8 +224,12 @@ def bit_tables(model) -> dict:
 
 def main(argv=None):
     args = parse_args(argv)
-    g = load_dataset(args.dataset, feat_norm=args.feat_norm)
-    print(g.summary())
+    args.feat_norm = args.feat_norm or DEFAULT_FEAT_NORM[args.dataset]
+    args.inductive = args.inductive or ("on" if args.dataset == "reddit" else "off")
+    g_all = load_dataset(args.dataset, feat_norm=args.feat_norm)
+    print(g_all.summary(), f"| feat_norm={args.feat_norm} inductive={args.inductive}"
+          + (f" | {len(g_all.splits)} splits, seed s uses split s % {len(g_all.splits)}" if g_all.splits else ""))
+    g = g_all
     sampled = args.model == "sage"
     if args.hidden is None:
         args.hidden = 256 if args.model == "sage" else 128          # Tab.III
@@ -223,19 +257,39 @@ def main(argv=None):
     for seed in range(args.seed_start, args.seed_start + args.seeds):
         t0 = time.time()
         torch.manual_seed(seed)
+        g = g_all.use_split(seed)                  # no-op for single-split datasets
+        # Training graph: the full graph (transductive, default) or, for Reddit, the graph
+        # induced by the training nodes (inductive; val/test nodes and their edges unseen).
+        g_train = g.train_subgraph() if args.inductive == "on" else g
         if sampled:
             # one fixed evaluation sample per run, and a separate stream for training samples
             ops = GraphOps.from_graph(g, "sage", args.samples, torch.Generator().manual_seed(seed))
             train_gen = torch.Generator().manual_seed(10_000 + seed)
-            train_ops = lambda: GraphOps.from_graph(g, "sage", args.samples, train_gen)
+            train_ops = lambda: GraphOps.from_graph(g_train, "sage", args.samples, train_gen)
             max_degree = args.samples + 1          # degree tables cover every sampled degree
         else:
             ops = GraphOps.from_graph(g, args.model)
-            train_ops = lambda: ops
-            max_degree = int(g.deg.max())
+            t_ops = ops if g_train is g else GraphOps.from_graph(g_train, args.model)
+            train_ops = lambda: t_ops
+            max_degree = int(g.deg.max())          # ≥ every training-graph degree too
         model = QGCN(dims, max_degree, norm=args.norm, frac_bits=args.frac_bits, dropout=args.dropout,
                      x_param=args.x_param)
-        fp32_test, fp32_val = train_fp32(model, g, ops, args, train_ops)
+        cache = _fp32_cache_path(args, seed)
+        if cache and os.path.exists(cache):
+            ck = torch.load(cache, weights_only=False)        # our own file (see _fp32_cache_path)
+            model.load_state_dict(ck["model"])
+            torch.set_rng_state(ck["rng"])
+            if sampled:
+                train_gen.set_state(ck["train_gen"])
+            fp32_test, fp32_val = ck["fp32_test"], ck["fp32_val"]
+            print(f"  FP32 model loaded from {cache}")
+        else:
+            fp32_test, fp32_val = train_fp32(model, g, ops, args, train_ops)
+            if cache:
+                os.makedirs(os.path.dirname(cache), exist_ok=True)
+                torch.save({"model": model.state_dict(), "rng": torch.get_rng_state(),
+                            "train_gen": train_gen.get_state() if sampled else None,
+                            "fp32_test": fp32_test, "fp32_val": fp32_val}, cache)
         row = {"seed": seed, "fp32_test": fp32_test, "fp32_val": fp32_val}
         if not args.fp32_only:
             model.calibrate(g.x, ops, args.x_init,

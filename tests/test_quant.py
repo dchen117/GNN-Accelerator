@@ -269,3 +269,61 @@ def test_lsq_scaling_changes_only_the_scale_gradient():
     g = 1.0 / torch.sqrt(n.clamp_min(1) * 7.0)                     # B_INIT = 4 -> Q_P = 7
     assert torch.allclose(grads[True][0], grads[False][0] * g, atol=1e-7)
     assert torch.allclose(grads[True][1], grads[False][1])
+
+
+def test_vectorized_edges_match_set_builder():
+    """data._edges_from_pairs (large graphs) must give the same edge set and degrees as the
+    original _build_edges (Planetoid), incl. duplicates, both directions and existing loops."""
+    import numpy as np
+    from mega_pt.data import _build_edges, _edges_from_pairs
+    rng = np.random.default_rng(0)
+    n = 50
+    s, d = rng.integers(0, n, 400), rng.integers(0, n, 400)
+    graph = {u: [] for u in range(n)}
+    for a, b in zip(s, d):
+        graph[int(a)].append(int(b))
+    s1, d1, deg1 = _build_edges(graph, n)
+    s2, d2, deg2 = _edges_from_pairs(s, d, n)
+    assert set(zip(s1.tolist(), d1.tolist())) == set(zip(s2.tolist(), d2.tolist()))
+    assert len(s2) == len(set(zip(s2.tolist(), d2.tolist())))          # no duplicates
+    assert (deg1 == deg2).all()
+    assert (np.diff(d2) >= 0).all()                                    # grouped by destination
+
+
+def test_splits_inductive_and_std():
+    import numpy as np
+    from mega_pt.data import _graph, _edges_from_pairs, _normalize_features
+    n = 6
+    src, dst, deg = _edges_from_pairs(np.array([0, 1, 2, 3, 4]), np.array([1, 2, 3, 4, 5]), n)
+    x = _normalize_features(np.arange(n * 3, dtype=np.float32).reshape(n, 3) * [1, 10, 0], "std")
+    assert np.allclose(x[:, :2].mean(0), 0, atol=1e-6) and np.allclose(x[:, :2].std(0), 1, atol=1e-5)
+    assert (x[:, 2] == 0).all()                                        # constant column -> 0
+    splits = [([0, 1, 2], [3], [4, 5]), ([3, 4, 5], [0], [1, 2])]
+    g = _graph("t", x, np.zeros(n), src, dst, deg, splits)
+    assert g.use_split(3).train_idx.tolist() == [3, 4, 5]              # seed 3 -> split 1
+    gt = g.train_subgraph()                                            # train = {0,1,2}
+    e = set(zip(gt.edge_src.tolist(), gt.edge_dst.tolist()))
+    assert (0, 1) in e and (2, 1) in e and (2, 3) not in e and (3, 3) in e
+    assert gt.deg.tolist() == [2, 3, 2, 1, 1, 1]
+
+
+def test_floyd_sampler_matches_degrees_and_is_uniform():
+    """Large-graph sampling path (Reddit): ≤ k distinct neighbors + self-loop per node, and
+    each neighbor of a high-degree node is picked with probability k/D (uniform k-subsets)."""
+    import torch
+    from mega_pt.model import sample_neighbors
+    deg, k = [3, 10, 40, 1], 5
+    src = torch.cat([torch.arange(D) + 10 for D in deg] + [torch.arange(4)])
+    dst = torch.cat([torch.full((D,), i) for i, D in enumerate(deg)] + [torch.arange(4)])
+    o = torch.argsort(dst, stable=True)
+    src, dst = src[o], dst[o]
+    gen = torch.Generator().manual_seed(0)
+    hits = torch.zeros(40)
+    R = 3000
+    for _ in range(R):
+        s, d = sample_neighbors(src, dst, 50, k, gen, large_graph_edges=0)
+        assert torch.bincount(d, minlength=50)[:4].tolist() == [min(D, k) + 1 for D in deg]
+        sel = s[(d == 2) & (s != 2)] - 10
+        assert sel.unique().numel() == k
+        hits[sel] += 1
+    assert (hits / R - k / 40).abs().max() < 0.03          # ~5σ for R = 3000

@@ -52,8 +52,15 @@ NORM_MODES = ("fp32", "fold", "per_source")
 
 
 def _dropout(x: torch.Tensor, p: float, training: bool) -> torch.Tensor:
-    """Dropout that also accepts a sparse COO x (NELL's X^(0)): drops stored non-zeros."""
+    """Dropout that also accepts a sparse COO x (NELL's X^(0)): drops stored non-zeros.
+
+    Very large dense inputs (Reddit's 233K x 602 X^(0)) use a mask from torch.rand: the same
+    dropout (keep with prob 1-p, scale by 1/(1-p)), but 2.5x faster on CPU, where
+    F.dropout's bernoulli_ is effectively single-threaded (2.4 s vs 1.0 s per call). Smaller
+    tensors keep F.dropout so earlier results stay bit-reproducible (same random stream)."""
     if not x.is_sparse:
+        if training and p > 0 and x.numel() > 50_000_000:
+            return x * (torch.rand_like(x) >= p) / (1 - p)
         return F.dropout(x, p, training)
     if not training or p == 0:
         return x
@@ -91,22 +98,52 @@ MODELS = ("gcn", "gin", "sage")
 
 
 def sample_neighbors(src: torch.Tensor, dst: torch.Tensor, num_nodes: int, k: int,
-                     generator: torch.Generator | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+                     generator: torch.Generator | None = None,
+                     large_graph_edges: int = 20_000_000) -> tuple[torch.Tensor, torch.Tensor]:
     """GraphSage neighbor sampling (Q-12): for every destination node keep at most k of its
     in-neighbors, chosen uniformly without replacement, plus its self-loop (always kept, so
     the sampled degree is min(d-1, k) + 1, which counts the self-loop as Q-01 does).
 
-    Vectorized: give each non-self edge a random key in [0, 1), sort by dst + key (groups edges
-    by destination in random order), and keep the first k of each group."""
+    Small graphs (E <= large_graph_edges; every MEGA dataset except Reddit): give each
+    non-self edge a random key in [0, 1), sort by dst + key, keep the first k of each group.
+
+    Large graphs (Reddit, 5e7-1e8 edges): that sort costs ~6 s and ~7 GB per epoch, so we use
+    _sample_floyd instead: same distribution (exact uniform k-subsets), O(N·k) work. It needs
+    the edges grouped by destination, which the large-graph loaders guarantee (CSC order,
+    as the hardware stores the graph)."""
     self_loop = src == dst
     s, d = src[~self_loop], dst[~self_loop]
-    key = d.double() + torch.rand(d.numel(), generator=generator, dtype=torch.float64)
-    order = torch.argsort(key)
-    s, d = s[order], d[order]
-    first = torch.searchsorted(d, d, right=False)          # index where each dst's group starts
-    keep = (torch.arange(d.numel()) - first) < k
     loops = torch.arange(num_nodes)
-    return torch.cat([s[keep], loops]), torch.cat([d[keep], loops])
+    if d.numel() <= large_graph_edges:
+        key = d.double() + torch.rand(d.numel(), generator=generator, dtype=torch.float64)
+        order = torch.argsort(key)
+        s, d = s[order], d[order]
+        first = torch.searchsorted(d, d, right=False)          # index where each dst's group starts
+        keep = (torch.arange(d.numel()) - first) < k
+        return torch.cat([s[keep], loops]), torch.cat([d[keep], loops])
+    assert bool((d[1:] >= d[:-1]).all()), "large graphs must have edges grouped by destination"
+    pick = _sample_floyd(d, num_nodes, k, generator)
+    return torch.cat([s[pick], loops]), torch.cat([d[pick], loops])
+
+
+def _sample_floyd(d: torch.Tensor, num_nodes: int, k: int, generator) -> torch.Tensor:
+    """Indices of the kept edges, for edges grouped by destination d.
+    Nodes with ≤ k edges keep all of them. For the others, Floyd's algorithm draws a uniform
+    random k-subset of the offsets 0..D-1, vectorized over nodes (k steps, one per element):
+        for j = D-k .. D-1:  t = uniform{0..j};  add t, or j if t was already chosen."""
+    count = torch.bincount(d, minlength=num_nodes)
+    start = torch.cumsum(count, 0) - count
+    keep_all = torch.nonzero(count[d] <= k).squeeze(1)
+    hi = torch.nonzero(count > k).squeeze(1)
+    D = count[hi]
+    chosen = torch.empty(hi.numel(), k, dtype=torch.long)
+    for j in range(k):
+        jj = D - k + j                                         # current upper bound (inclusive)
+        t = (torch.rand(hi.numel(), generator=generator, dtype=torch.float64) * (jj + 1)).long()
+        t = torch.minimum(t, jj)                               # guard against rand() == 1 - eps rounding
+        dup = (chosen[:, :j] == t.unsqueeze(1)).any(1)
+        chosen[:, j] = torch.where(dup, jj, t)
+    return torch.cat([keep_all, (start[hi].unsqueeze(1) + chosen).reshape(-1)])
 
 
 @dataclass

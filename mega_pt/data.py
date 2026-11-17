@@ -1,8 +1,12 @@
-"""Planetoid datasets (Cora, CiteSeer, PubMed, NELL) with the standard public split.
+"""Datasets: MEGA's (Cora, CiteSeer, PubMed, NELL, Reddit) and our extra evaluation sets
+(Roman-Empire, Amazon-Ratings, City-Networks Paris; see docs/beyond-mega/01-extra-datasets.md).
 
 Decisions implemented here (see docs/mega-kb/04-open-questions.md):
   Q-01  degree = in-degree with self-loops counted.
-  Q-14  standard Planetoid public split (Kipf & Welling / Yang et al.).
+  Q-14  standard Planetoid public split (Kipf & Welling / Yang et al.); Reddit: the standard
+        GraphSAGE split (inductive training is handled in train.py).
+Every graph is made undirected, de-duplicated, and given exactly one self-loop per node,
+whatever the source format, so the degree definition (Q-01) is the same for all datasets.
 
 The raw files are the original Planetoid pickles from github.com/kimiyoung/planetoid.
 They are Python-2 pickles, and unpickling untrusted data can run arbitrary code, so we
@@ -14,8 +18,10 @@ from __future__ import annotations
 
 import os
 import pickle
+import tarfile
+import zipfile
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 import scipy.sparse as sp
@@ -116,7 +122,10 @@ class Graph:
     edge_src  (E,)   int64 source node j of each edge j -> i, self-loops INCLUDED
     edge_dst  (E,)   int64 destination node i
     deg       (N,)   int64 in-degree counting the self-loop (Q-01), so deg >= 1
-    train/val/test_idx  int64 index tensors of the public split
+    train/val/test_idx  int64 index tensors of the public split (for datasets with several
+              published splits: split 0; see `splits` / `use_split`)
+    splits    optional list of (train_idx, val_idx, test_idx), one per published split
+              (Roman-Empire / Amazon-Ratings have 10). train.py runs seed s on split s % 10.
     """
 
     name: str
@@ -128,6 +137,25 @@ class Graph:
     train_idx: torch.Tensor
     val_idx: torch.Tensor
     test_idx: torch.Tensor
+    splits: list | None = None
+
+    def use_split(self, i: int) -> "Graph":
+        """Same graph, with train/val/test set to published split i (mod the number of splits)."""
+        if not self.splits:
+            return self
+        tr, va, te = self.splits[i % len(self.splits)]
+        return replace(self, train_idx=tr, val_idx=va, test_idx=te)
+
+    def train_subgraph(self) -> "Graph":
+        """Inductive training graph (GraphSAGE's Reddit protocol): keep only edges whose two
+        ends are both training nodes. Node ids and x are unchanged (val/test nodes simply
+        become isolated, keeping only their self-loop), so the same indices work for both."""
+        is_tr = torch.zeros(self.num_nodes, dtype=torch.bool)
+        is_tr[self.train_idx] = True
+        keep = (is_tr[self.edge_src] & is_tr[self.edge_dst]) | (self.edge_src == self.edge_dst)
+        src, dst = self.edge_src[keep], self.edge_dst[keep]
+        return replace(self, name=self.name + "[train-induced]", edge_src=src, edge_dst=dst,
+                       deg=torch.bincount(dst, minlength=self.num_nodes))
 
     @property
     def num_nodes(self) -> int:
@@ -181,10 +209,28 @@ def _build_edges(graph: dict, n: int):
     return src, dst, np.bincount(dst, minlength=n)
 
 
-def load_dataset(name: str, feat_norm: str = "none") -> Graph:
-    """Entry point used by train.py: cora / citeseer / pubmed / nell."""
-    if name.lower() == "nell":
+DATASETS = ("cora", "citeseer", "pubmed", "nell", "reddit",
+            "roman-empire", "amazon-ratings", "city-paris")
+# Input preprocessing when --feat-norm is not given. MEGA's bag-of-words sets keep the Q-14
+# choice (row). The others hold embeddings / mixed-unit columns where a row sum is not
+# meaningful (it can be ~0); there we z-score each column. See docs/beyond-mega/01-extra-datasets.md.
+DEFAULT_FEAT_NORM = {"cora": "row", "citeseer": "row", "pubmed": "row", "nell": "row",
+                     "reddit": "none", "roman-empire": "std", "amazon-ratings": "std",
+                     "city-paris": "std"}
+
+
+def load_dataset(name: str, feat_norm: str | None = None) -> Graph:
+    """Entry point used by train.py. feat_norm=None picks DEFAULT_FEAT_NORM[name]."""
+    name = name.lower()
+    feat_norm = feat_norm or DEFAULT_FEAT_NORM[name]
+    if name == "nell":
         return load_nell(feat_norm=feat_norm)
+    if name in ("roman-empire", "amazon-ratings"):
+        return load_heterophilous(name, feat_norm=feat_norm)
+    if name == "city-paris":
+        return load_city("paris", feat_norm=feat_norm)
+    if name == "reddit":
+        return load_reddit(feat_norm=feat_norm)
     return load_planetoid(name, feat_norm=feat_norm)
 
 
@@ -317,8 +363,160 @@ def load_planetoid(name: str, root: str = DEFAULT_ROOT, feat_norm: str = "row") 
     )
 
 
+# ---------------------------------------------------------------------------
+# Extra datasets (Reddit + docs/beyond-mega/01-extra-datasets.md)
+# ---------------------------------------------------------------------------
+DATA_ROOT = os.path.dirname(DEFAULT_ROOT)
+# Pinned files. The hashes were recorded on first download (2026-11-17) from these URLs;
+# a mismatch means the upstream file changed and results may no longer be comparable.
+EXTRA_FILES = {
+    # Platonov et al. 2023 (ICLR), github.com/yandex-research/heterophilous-graphs
+    "roman-empire": ("https://raw.githubusercontent.com/yandex-research/heterophilous-graphs/main/data/roman_empire.npz",
+                     "a58ba741d123bf892fe5c872138d07463d75a2e9012360b8dd78ac2d4766d428"),
+    "amazon-ratings": ("https://raw.githubusercontent.com/yandex-research/heterophilous-graphs/main/data/amazon_ratings.npz",
+                       "4c3a3e3b9d9f6cba0fede4625a00aad8c5721c1a36ed771367f446763241c7dd"),
+    # Liang et al. 2025 (NeurIPS), github.com/LeonResearch/City-Networks (same files PyG 2.7 uses)
+    "city-paris": ("https://raw.githubusercontent.com/LeonResearch/City-Networks/main/data/paris.tar.gz",
+                   "e7b12f028aceb8057b8cbb65d5c89d95dba3122483c0419cec9872e9d652b41a"),
+    # Hamilton et al. 2017 Reddit, as packaged by DGL (data.dgl.ai is blocked from our cloud
+    # environment; this is the S3 bucket behind it). PyG's Reddit is the same data.
+    "reddit": ("https://dgl-data.s3.amazonaws.com/dataset/reddit.zip",
+               "9a16353c28f8ddd07148fc5ac9b57b818d7911ea0fbe9052d66d49fc32b372bf"),
+}
+
+
+def _fetch(name: str) -> str:
+    """Download EXTRA_FILES[name] into data/<name>/ once, verify sha256, return the path."""
+    url, want = EXTRA_FILES[name]
+    root = os.path.join(DATA_ROOT, name)
+    os.makedirs(root, exist_ok=True)
+    dst = os.path.join(root, os.path.basename(url))
+    if not os.path.exists(dst):
+        print(f"[data] downloading {url}")
+        urllib.request.urlretrieve(url, dst + ".part")
+        os.replace(dst + ".part", dst)
+    import hashlib
+    h = hashlib.sha256()
+    with open(dst, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 24), b""):
+            h.update(chunk)
+    if h.hexdigest() != want:
+        raise RuntimeError(f"{dst}: sha256 {h.hexdigest()} != expected {want}; delete it and retry")
+    return dst
+
+
+def _edges_from_matrix(a: sp.spmatrix):
+    """Vectorized version of _build_edges for large graphs (Reddit: 1.1e8 stored edges, far too
+    many for a Python set, and too many for int64 sort-based dedup in 15 GB of RAM).
+    Symmetrize (A + Aᵀ, so duplicates merge), drop self-loops, then add one self-loop per node.
+    Returns (src, dst, deg) int64 like _build_edges. Edges come out grouped by DESTINATION
+    (CSC order, as the hardware stores the graph), which sample_neighbors needs on big graphs."""
+    n = a.shape[0]
+    a = a.tocsr().astype(np.float32)
+    a = (a + a.T).tocsr()                           # union of both directions; sums duplicates
+    a.setdiag(0)
+    a.eliminate_zeros()
+    a.data[:] = 1.0
+    a = (a + sp.identity(n, dtype=np.float32, format="csr")).tocoo()   # exactly one self-loop
+    # Row r of the symmetric matrix lists r's neighbors; use it as destination r (in-edges).
+    dst = a.row.astype(np.int64)
+    src = a.col.astype(np.int64)
+    del a
+    return src, dst, np.bincount(dst, minlength=n)
+
+
+def _edges_from_pairs(src: np.ndarray, dst: np.ndarray, n: int):
+    """Edge list (src[k] -> dst[k]) to (src, dst, deg); see _edges_from_matrix."""
+    a = sp.coo_matrix((np.ones(len(src), dtype=np.float32), (src, dst)), shape=(n, n))
+    return _edges_from_matrix(a)
+
+
+def _normalize_features(x: np.ndarray, feat_norm: str) -> np.ndarray:
+    """row  = divide each row by its sum (Q-14, bag-of-words sets).
+    std  = z-score each column over ALL nodes (transductive, uses no labels); constant
+           columns are left at 0. Used where rows are embeddings or mixed-unit columns.
+    none = raw."""
+    x = np.asarray(x, dtype=np.float32)
+    if feat_norm == "row":
+        s = x.sum(1, keepdims=True)
+        s[s == 0] = 1.0
+        return x / s
+    if feat_norm == "std":
+        mu = x.mean(0, keepdims=True, dtype=np.float64).astype(np.float32)
+        sd = x.std(0, keepdims=True, dtype=np.float64).astype(np.float32)
+        sd[sd == 0] = 1.0
+        x = x - mu                                      # float32 throughout (Reddit X is 0.56 GB)
+        x /= sd
+        return x
+    if feat_norm == "none":
+        return x
+    raise ValueError(feat_norm)
+
+
+def _graph(name, x, y, src, dst, deg, splits) -> Graph:
+    t = lambda a: torch.as_tensor(np.asarray(a), dtype=torch.long)
+    splits = [(t(a), t(b), t(c)) for a, b, c in splits]
+    return Graph(name=name, x=torch.from_numpy(x), y=t(y), edge_src=torch.from_numpy(src),
+                 edge_dst=torch.from_numpy(dst), deg=torch.from_numpy(deg).long(),
+                 train_idx=splits[0][0], val_idx=splits[0][1], test_idx=splits[0][2],
+                 splits=splits if len(splits) > 1 else None)
+
+
+def load_heterophilous(name: str, feat_norm: str = "std") -> Graph:
+    """Roman-Empire / Amazon-Ratings (Platonov et al. 2023). Accuracy is their metric for both.
+    The .npz holds node_features, node_labels, edges (E,2) and 10 boolean split masks
+    (50/25/25). The authors make the graph bidirected; _edges_from_pairs does the same."""
+    z = np.load(_fetch(name), allow_pickle=False)
+    x = _normalize_features(z["node_features"], feat_norm)
+    e = z["edges"]
+    src, dst, deg = _edges_from_pairs(e[:, 0], e[:, 1], x.shape[0])
+    splits = [tuple(np.flatnonzero(z[k][i]) for k in ("train_masks", "val_masks", "test_masks"))
+              for i in range(z["train_masks"].shape[0])]
+    return _graph(name, x, z["node_labels"], src, dst, deg, splits)
+
+
+def load_city(city: str = "paris", feat_norm: str = "std") -> Graph:
+    """City-Networks (Liang et al. 2025), following the authors' / PyG's CityNetwork defaults:
+    augmented node features (37 columns), labels = 10 quantile classes of the 16-hop
+    eccentricity, one fixed split (10/10/80). Files are torch tensors, read weights_only."""
+    name = f"city-{city}"
+    path = _fetch(name)
+    out = os.path.join(os.path.dirname(path), "raw")
+    base = os.path.join(out, city)
+    if not os.path.exists(os.path.join(base, "edge_indices.pt")):
+        with tarfile.open(path) as tf:
+            tf.extractall(out, filter="data")          # "data" filter: no absolute paths / links out
+    L = lambda f: torch.load(os.path.join(base, f), weights_only=True)
+    x = _normalize_features(L("node_features_augmented.pt").numpy(), feat_norm)
+    ei = L("edge_indices.pt").numpy()
+    src, dst, deg = _edges_from_pairs(ei[0], ei[1], x.shape[0])
+    split = tuple(np.flatnonzero(L(f"{k}_mask.pt").numpy()) for k in ("train", "valid", "test"))
+    return _graph(name, x, L("10-chunk_16-hop_node_labels.pt").numpy(), src, dst, deg, [split])
+
+
+def load_reddit(feat_norm: str = "std") -> Graph:
+    """Reddit (GraphSAGE): 232,965 posts, 41 subreddits, 602 features, the standard split
+    (node_types 1/2/3 = train/val/test; 153,431 / 23,831 / 55,703).
+    The zip holds reddit_data.npz (feature, label, node_types) and reddit_graph.npz (a scipy
+    sparse matrix saved with save_npz, loaded without pickle). Extracted once to data/reddit/."""
+    path = _fetch("reddit")
+    root = os.path.dirname(path)
+    if not os.path.exists(os.path.join(root, "reddit_graph.npz")):
+        with zipfile.ZipFile(path) as zf:
+            for m in ("reddit_data.npz", "reddit_graph.npz"):
+                zf.extract(m, root)                    # fixed member names only
+    # graph first, while memory is free; then features (stored float64 -> float32)
+    src, dst, deg = _edges_from_matrix(sp.load_npz(os.path.join(root, "reddit_graph.npz")))
+    z = np.load(os.path.join(root, "reddit_data.npz"), allow_pickle=False)
+    x = _normalize_features(z["feature"].astype(np.float32), feat_norm)
+    nt = z["node_types"]
+    split = tuple(np.flatnonzero(nt == k) for k in (1, 2, 3))
+    return _graph("reddit", x, z["label"], src, dst, deg, [split])
+
+
 if __name__ == "__main__":
     # Quick check: python -m mega_pt.data   (edge counts should match Tab.II of the paper:
     # Cora 10556, CiteSeer 9104, PubMed 88648, NELL 251550)
-    for ds in ("cora", "citeseer", "pubmed", "nell"):
+    import sys
+    for ds in sys.argv[1:] or ("cora", "citeseer", "pubmed", "nell"):
         print(load_dataset(ds).summary())

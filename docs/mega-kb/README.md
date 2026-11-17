@@ -19,6 +19,9 @@ Gaps are listed in [`04-open-questions.md`](04-open-questions.md) and are decide
 | [`04-open-questions.md`](04-open-questions.md) | Unresolved details and inconsistencies (Q-01 … ), and which implementation path each blocks |
 | [`05-eval-reference.md`](05-eval-reference.md) | Datasets, model configs, accuracy/CR targets, hardware config, MEGA's reported results |
 
+Our own extensions that go beyond the paper (e.g. extra evaluation datasets) are kept out of
+this knowledge base, in [`../beyond-mega/`](../beyond-mega/01-extra-datasets.md).
+
 ## Labeling rules (apply to every file)
 
 | Tag | Meaning |
