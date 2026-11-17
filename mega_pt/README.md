@@ -470,6 +470,54 @@ FP32 model comes from `--fp32-cache`), 11.5 GB peak RAM.
 - Not run: 10 seeds (std is already 0.02 over 3), GCN/GIN on Reddit (not in Tab.VI), a
   transductive variant.
 
+### 2026-11-17 — Extra datasets (Roman-Empire, Amazon-Ratings, City-Networks Paris), 3 seeds
+
+Why these datasets and how they are prepared: `docs/beyond-mega/01-extra-datasets.md`.
+MEGA has no numbers for them, so the reference is our own FP32 model. Settings are the
+defaults (learned α, MSE init, fold, `--feat-norm std`, 2 layers, 200 + 200 epochs,
+M_target at the 2-bit dense floor). Seeds 0–2 use published splits 0–2 (Paris has one
+split). q_test % @ `avg_bits_sparse`; dense bits in brackets where they are above 2.0:
+
+| Model / dataset | FP32 (ours) | PTQ (4 bit) | λ = 0 | λ = 1e-7 | λ = 1e-6 | λ = 1e-5 |
+|---|---|---|---|---|---|---|
+| GCN Roman-Empire | 47.43 ± 0.72 | 46.01 | 46.88 @ 2.27 [3.97] | **46.53 ± 0.24 @ 1.32 [2.71]** | 46.72 @ 1.13 [2.21] | 46.28 @ 0.83 |
+| GCN Amazon-Ratings | 47.90 ± 0.18 | 47.75 | 48.52 @ 1.95 [4.85] | **47.92 ± 0.43 @ 0.71 [2.15]** | 47.76 @ 0.52 | 47.89 @ 0.47 |
+| GCN Paris | 27.01 ± 0.09 | 18.47 | 26.43 @ 1.63 [4.94] | 24.18 ± 0.19 @ 0.56 | 24.19 @ 0.56 | 24.18 @ 0.57 |
+| GIN Roman-Empire | 45.17 ± 0.43 | 39.78 | 44.02 @ 1.87 [3.64] | **46.49 ± 0.49 @ 1.14 [2.61]** | 45.09 @ 0.79 | 45.21 @ 0.70 |
+| GIN Amazon-Ratings | 45.11 ± 0.68 | 29.47 | 39.11 @ 1.41 [3.84] | **40.02 ± 0.32 @ 0.76 [2.13]** | 39.16 @ 0.60 | 39.56 @ 0.59 |
+| GIN Paris | 26.96 ± 0.07 | 19.38 | 25.97 @ 1.06 [4.32] | 24.92 ± 0.16 @ 0.38 | 24.79 @ 0.37 | 24.88 @ 0.37 |
+| GraphSage Roman-Empire | 45.46 ± 0.55 | 44.35 | 45.85 @ 2.20 [4.53] | **45.81 ± 1.05 @ 1.04 [2.69]** | 46.68 @ 0.76 | 46.75 @ 0.76 |
+| GraphSage Amazon-Ratings | 47.98 ± 0.26 | 47.71 | 48.58 @ 1.97 [4.92] | **48.33 ± 0.37 @ 0.63 [2.14]** | 48.18 @ 0.48 | 48.24 @ 0.47 |
+| GraphSage Paris | 27.63 ± 0.24 | 18.74 | 26.99 @ 1.66 [4.90] | 24.60 ± 0.10 @ 0.57 | 24.73 @ 0.57 | 24.56 @ 0.57 |
+
+Bold: the operating point picked by the Reddit rule (the largest λ that still gives
+degree-dependent bits). Raw per-run numbers: `runs/ext/*/results.json`.
+
+- **Roman-Empire and Amazon-Ratings quantize like MEGA's own datasets** for GCN and
+  GraphSage. At λ = 1e-7 they stay within 0.9 points of FP32, at 0.6–1.3 sparse bits, with
+  non-uniform per-degree bits (dense 2.1–2.7). GIN on Roman-Empire beats its FP32 at
+  λ = 1e-7. Differences between λ ≤ 1e-6 are mostly within the seed std.
+- **λ ≥ 1e-6 gives uniform 2 bits on nearly every row**, the same pattern as Reddit. Those
+  columns are a uniform-2-bit reference, not MEGA's degree-aware scheme.
+- **Paris costs 2.4–3 points at every λ > 0, for all three models**, and every λ > 0 ends
+  at 2 bits for every degree. With degrees 2–9 there is nothing for degree-aware
+  allocation to exploit, as expected (see the dataset doc). With the λ = 0 bit budget
+  (about 5 dense bits) the loss shrinks to 0.6–1.0. Paris is therefore precision-sensitive,
+  and MEGA's memory penalty pushes it to a bit width it can't take. PTQ at 4 bits loses
+  8–9 points, the worst of any dataset. Its 37 z-scored features include coordinates, where
+  small differences carry the label.
+- **GIN on Amazon-Ratings loses about 6 points even at λ = 0**, so the bit budget is not the
+  cause. PTQ already loses 15.6. Amazon-Ratings has the heaviest degree tail of the three
+  (max 133), and GIN sums over neighbors without normalization, so high-degree aggregates
+  are much larger than low-degree ones (max |psum| up to 479). Not investigated; the
+  per-degree scale ranges are the first thing to check.
+- **FP32 accuracies are low in absolute terms** (Paris 27%, 10 classes). That is expected
+  for 2-layer models with no residuals or input/output MLPs on these benchmarks, and it is
+  the gap the planned residual experiments target. We have not compared against the
+  datasets' published baselines, which use deeper models with residuals.
+- Integer partial sums stay at or below 479 (16 bits is ample).
+- Not run: 10 seeds/splits, residual variants, deeper models.
+
 ## Known limitations / next steps
 
 - **b convergence:** Adam moves b by about `--lr-bits` per step, so 200 epochs allow about 2 bits

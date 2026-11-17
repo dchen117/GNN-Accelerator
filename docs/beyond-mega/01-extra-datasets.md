@@ -1,6 +1,6 @@
 # Extra evaluation datasets (beyond MEGA)
 
-**Status (2026-11-17):** decided. The user chose Roman-Empire, Amazon-Ratings and
+**Status (2026-11-17):** decided; first results (3 seeds, all λ) are in `mega_pt/README.md` ("Extra datasets"). The user chose Roman-Empire, Amazon-Ratings and
 City-Networks (Paris) as extra evaluation datasets, on top of MEGA's own (Cora, CiteSeer,
 PubMed, NELL, Reddit). Loaders are in `mega_pt/data.py`; run with `--dataset roman-empire |
 amazon-ratings | city-paris`.
