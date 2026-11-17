@@ -24,7 +24,12 @@ The CPU-only torch wheel is much smaller. Locally, you can install that one inst
 .venv/bin/pip install torch --index-url https://download.pytorch.org/whl/cpu
 ```
 
-The datasets download automatically on first use to `data/planetoid/`, which is gitignored.
+The datasets download automatically on first use to `data/`, which is gitignored. Reddit
+is a 1.4 GB download (from DGL's S3 bucket; `data.dgl.ai` and `data.pyg.org` are blocked here)
+and needs about 12 GB of RAM to train. The extra evaluation datasets (Roman-Empire,
+Amazon-Ratings, City-Networks Paris) are described in
+[`docs/beyond-mega/01-extra-datasets.md`](../docs/beyond-mega/01-extra-datasets.md).
+Every non-Planetoid file is pinned by sha256 (`data.EXTRA_FILES`).
 
 ## Run
 
@@ -33,6 +38,12 @@ PubMed 88648, NELL 251550):
 
 ```bash
 .venv/bin/python -m mega_pt.data
+```
+
+Any dataset by name (Reddit should print 114615892 edges and a 153431/23831/55703 split):
+
+```bash
+.venv/bin/python -m mega_pt.data reddit roman-empire amazon-ratings city-paris
 ```
 
 Unit tests (each test names the equation or Q-ID it checks):
@@ -63,6 +74,22 @@ GIN and GraphSage (Q-12; Tab.III hidden sizes 128 / 256 are the defaults):
 All three use Eq.(1)'s single-W layer and differ only in Ã: GIN-0 sums over A+I, GraphSage
 averages over the node plus 25 sampled in-neighbors (`--samples`). GraphSage draws a new
 sample every training epoch and evaluates on one fixed sample seeded by the run seed.
+
+GraphSage on Reddit (Tab.VI). Training is inductive by default for Reddit (`--inductive on`:
+the training graph is induced by the training nodes). One seed takes about 70 minutes on 3
+CPU threads. `--fp32-cache` reuses the FP32-pretrained model when only QAT settings change:
+
+```bash
+.venv/bin/python -m mega_pt.train --model sage --dataset reddit --lam 1e-8 --target-dense-bits 2.0 --seeds 3 --fp32-cache runs/fp32_cache
+```
+
+Extra evaluation datasets (ours, not in MEGA). Roman-Empire and Amazon-Ratings have 10
+published splits, and seed s uses split s % 10. Features are z-scored per column by default
+for these (`--feat-norm std`):
+
+```bash
+.venv/bin/python -m mega_pt.train --dataset roman-empire --lam 1e-6 --target-dense-bits 2.0
+```
 
 The earlier MSE re-fit setting (matches Tab.VI at fewer bits, but every degree ends at 2 bits)
 is kept as an option:
@@ -104,7 +131,7 @@ Outputs go to `runs/<name>/`:
 
 | File | Contents |
 |---|---|
-| `data.py` | Planetoid loader (Cora/CiteSeer/PubMed/NELL) with a whitelist unpickler. Public split, self-loops, in-degree (Q-01, Q-14). NELL's X^(0) is sparse |
+| `data.py` | Planetoid loader (Cora/CiteSeer/PubMed/NELL) with a whitelist unpickler. Public split, self-loops, in-degree (Q-01, Q-14). NELL's X^(0) is sparse. Reddit and the extra datasets: sha256-pinned downloads, vectorized edge building (edges grouped by destination), per-column z-score, multiple splits, train-induced subgraph |
 | `quant.py` | Eq.(2) quantizer with STE, the degree-indexed (α, b) table, 4-bit column quantizer, Q1.f fixed point |
 | `model.py` | `QGCN` (the Eq.(1) layer for all three models) and `GraphOps` (Ã per model, GraphSage neighbor sampling, Q-12). The three normalization modes (Q-11) are described in the module docstring |
 | `metrics.py` | Accuracy, average-bits definitions (Q-15), memory, partial-sum / lost-B checks |
@@ -141,6 +168,10 @@ and the measurement is given.
 | α learning rate 1e-3 (`--lr-alpha`; unused with `--clip-refit`; the α-mode results used it) | At 1e-2, α drifted upward and the *training* loss rose (0.24 → 1.07; test 79% → 54%). This is consistent with the STE gradient being biased on values that round to 0. At 1e-3 it was stable. |
 | QAT weight learning rate 1e-3 (`--lr-qat-weights`) | 1e-2 overfits during the extra 200 epochs: 79.7/78.9 vs 80.4/79.5 test. |
 | Row-normalized input features (`--feat-norm row`, default again since 2026-11-15) | 2026-11-14 we switched to raw features: with max/7 init, row normalization made many layer-0 values round to 0 (Cora QAT 75.9 vs 79.7). With MSE init + re-fit that problem is gone (Cora λ = 1e-7: row 81.77 ± 0.67 vs raw 81.00 ± 0.46, 3 seeds), and row is needed on CiteSeer (FP32 71.4 row vs 68.8 raw, 5 seeds; Tab.VI 71.1). One preprocessing for every dataset is simpler. **Amends Q-14** (back to Kipf's preprocessing). |
+| **Per-column z-score** for the extra datasets (`--feat-norm std`, their default; added 2026-11-17) | Row normalization is meaningless for embeddings (Roman-Empire / Amazon-Ratings rows are ~50% negative, some sum to ~0) and for Paris's mixed units. FP32 GCN, 3 seeds: Roman-Empire 47.43 vs 42.73 raw; Amazon-Ratings 47.90 vs 43.34 raw; City-Networks Paris see Results log. Reddit stays raw: it ships already standardized. Details: `docs/beyond-mega/01-extra-datasets.md`. |
+| **Inductive Reddit training** (`--inductive on`, Reddit default) | Q-14's decision (the standard GraphSAGE protocol). The training graph keeps only edges between training nodes. The Eq.(4) memory term then uses the *evaluation* graph's degrees, because val/test nodes are isolated (degree 1) in the training graph and would misstate the stored graph's memory. |
+| **Floyd sampling** on graphs with > 2·10⁷ edges (Reddit) | The sort-based sampler took 6 s and ~7 GB per Reddit epoch; Floyd's algorithm, vectorized over nodes, takes 1.7 s. Same distribution (exact uniform k-subsets; unit-tested). Smaller graphs keep the sort path, so earlier results are unchanged. |
+| Dropout mask from `torch.rand` for inputs with > 5·10⁷ entries (Reddit X⁽⁰⁾) | `F.dropout` is effectively single-threaded on CPU: 2.4 s vs 1.0 s per call. Same dropout; smaller tensors keep `F.dropout` (bit-reproducible). |
 | Dropout after the quantizer | Applying dropout's 1/(1−p) rescale before the quantizer would make the quantizer see different values in training and eval, which biases α. |
 | Reported epoch = last QAT epoch | b is still moving during QAT. Best-validation selection could report bits that differ from the final model. |
 
@@ -400,8 +431,9 @@ neighbors with a single W, hidden 256. q_test %, avg bits = `avg_bits_sparse`:
   check"): PubMed beats Tab.VI at λ = 1e-6, Cora matches its accuracy at λ = 1e-5 but with
   more bits, CiteSeer is 1–3 points short. Not tuned further yet; no 10-seed runs yet. The
   MSE re-fit option matched Tab.VI on all three at λ = 1e-6 (10 seeds; 2026-11-15).
-- **Scope:** GCN, GIN and GraphSage (Q-12). Reddit is not loaded yet (download host
-  blocked). NELL is loaded (sparse X^(0), PyG construction, Tab.II sizes reproduced).
+- **Scope:** GCN, GIN and GraphSage (Q-12). Reddit is loaded from DGL's S3 bucket (Tab.II
+  sizes reproduced); NELL is loaded (sparse X^(0), PyG construction, Tab.II sizes
+  reproduced). Extra evaluation datasets: Roman-Empire, Amazon-Ratings, City-Networks Paris.
 - **NELL source:** the official hosts are blocked from our cloud environment, so the loader
   fetches a GitHub LFS mirror and verifies each file's sha256 (see `data.py`).
 - **Scales treated as exact:** the scale multiplications (α·β, γ, d^(−1/2)) are assumed
