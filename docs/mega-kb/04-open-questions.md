@@ -1,6 +1,6 @@
 # 04 — Open Questions, Gaps, and Inconsistencies
 
-**Status (2026-11-15):** Q-01–Q-15 have decisions (Q-11 decided as fold on Cora + NELL; Reddit pending). GCN matches Tab.VI on Cora, CiteSeer and PubMed (Q-04 amended: MSE clip init + re-fit). Q-16 onward are
+**Status (2026-11-17):** Q-01–Q-15 have decisions (Q-11 decided as fold on Cora + NELL; Reddit, which is GraphSage-only, cannot test it). GCN matches Tab.VI on Cora, CiteSeer and PubMed (Q-04 amended: MSE clip init + re-fit). Q-16 onward are
 open. The PyTorch model implementing them is in `mega_pt/`.
 
 Each entry lists what the paper says (with citations), what is missing or conflicting, and
@@ -208,7 +208,7 @@ should say which kind it is: filling a gap, or departing from a stated detail.
   - Trade-off: X⁽⁰⁾ dominates Eq.(4) (e.g. Cora 1433 vs 128 dims), so the memory penalty mostly
     acts on the input layer.
 
-### Q-11 — Adjacency normalization and edge weights `[PT][SIM]` decided (fold; Reddit pending)
+### Q-11 — Adjacency normalization and edge weights `[PT][SIM]` decided (fold; Reddit cannot test it, see below)
 - Says: Eq.(1) uses normalized Ã (p.3). §IV says A ∈ {0,1}^(N×N) (p.5). §V-D: features are
   "multiplied with the corresponding edge weight of A broadcasted to each AU, which is stored
   in the Edge Buffer using the CSC format" (p.8). AUs do "integer addition and
@@ -248,6 +248,10 @@ should say which kind it is: filling a gap, or departing from a stated detail.
       f=4 L0 partial sum (29,897) by about 4, past the 16-bit accumulator (Q-25).
     - Not closed:
       - Reddit is untested. It needs GraphSage (Q-12), and its download host is blocked here.
+        **Update 2026-11-17:** Reddit now loads (DGL's S3 bucket). Tab.VI's Reddit model is
+        GraphSage, whose normalization has no source factor (s = 1, t = 1/d in the Encoder),
+        so fold and per_source are identical there. Reddit cannot reconfirm Q-11. It does show
+        the hubs are harmless under sampling: max |psum| 182 (`mega_pt/README.md`, 2026-11-17).
       - NELL QAT itself is noisy (one seed collapses in every mode).
     - The per-source w table and AU-reuse design above stay documented as the fallback.
 
@@ -316,6 +320,11 @@ should say which kind it is: filling a gap, or departing from a stated detail.
   dropout 0.5, 200 epochs, hidden 128. FP32 pretraining, then quantization-aware fine-tuning
   initialized from it. 10 seeds for mean ± std. Reddit (later): the standard GraphSAGE inductive
   split.** (2026-11-14)
+  - **Reddit implemented 2026-11-17:** standard split (153,431 / 23,831 / 55,703), inductive:
+    training sees only the train-induced subgraph, and evaluation uses the full graph. The
+    memory term counts the evaluation graph's degrees, which are what the hardware stores.
+    Features `--feat-norm none` (already standardized). Result: 93.58 ± 0.02 @ 0.66 bits
+    (3 seeds, λ = 1e-9) vs Tab.VI 95.6 ± 0.2 @ 2.74; table in `mega_pt/README.md`.
   - Why: [INTERP] the paper's FP32 GCN Cora 81.5% equals the standard-split result; Kipf & Welling
     hyperparameters are the common default. Pretraining provides the FP32 column and α/β init.
   - Trade-off: the paper's 2.04× training time suggests a recipe we can't verify.

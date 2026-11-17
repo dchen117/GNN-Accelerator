@@ -422,6 +422,54 @@ neighbors with a single W, hidden 256. q_test %, avg bits = `avg_bits_sparse`:
 - Not run: 10 seeds, GIN PubMed and GraphSage CiteSeer/PubMed (not in Tab.VI), Reddit
   (blocked).
 
+### 2026-11-17 — GraphSage on Reddit (Tab.VI row), inductive, 3 seeds
+
+Settings: same defaults as above (learned α, MSE init, fold, 200 + 200 epochs, M_target at
+the 2-bit dense floor), GraphSage-mean with a single W, hidden 256, 25 sampled neighbors,
+`--feat-norm none` (features ship standardized), inductive training on the train-induced
+subgraph, evaluation on the full graph. About 1.7 h per seed on 3 CPU threads (1.1 h when the
+FP32 model comes from `--fp32-cache`), 11.5 GB peak RAM.
+
+**λ sweep, seed 0 only** (FP32 93.72; q_test %, avg bits = `avg_bits_sparse` / `avg_bits_dense_all`):
+
+| λ | q_test | sparse bits | dense bits | per-degree bits |
+|---|---|---|---|---|
+| 0 | 93.70 | 1.37 | 4.66 | no memory penalty |
+| 1e-9 | 93.57 | 0.74 | 2.28 | layer 1 non-uniform: degrees 1–4 at 3 bits, 5–25 at 2, degree 26 at 3 |
+| 1e-8 | 93.50 | 0.49 | 2.00 | all degrees at 2 bits |
+| 1e-7 | 93.54 | 0.49 | 2.00 | all degrees at 2 bits |
+
+- λ ≥ 1e-8 drives every degree to the 2-bit floor. That is uniform 2 bits, the outcome the
+  fidelity constraint rules out as "MEGA", even though accuracy barely moves. **We chose
+  λ = 1e-9**: the largest λ in the grid that still gives degree-dependent bits. Reddit needs
+  a much smaller λ than Cora (1e-5) because the memory term scales with N·F (233K nodes ×
+  602 features), so λ·M is about 1,000× larger at the same λ.
+- Degree 26 means "full sample" (25 neighbors + self). 88% of nodes are there, so its bit
+  width dominates the averages.
+
+**Result, λ = 1e-9, seeds 0–2:**
+
+| | FP32 (ours) | PTQ (4 bit) | MEGA (ours) | avg bits sparse / dense | CR (sparse) | Tab.VI |
+|---|---|---|---|---|---|---|
+| GraphSage Reddit | 93.70 ± 0.01 | 93.43 ± 0.02 | **93.58 ± 0.02** | 0.66 ± 0.08 / 2.28 | 48.9× | 95.6 ± 0.2 @ 2.74, 11.7× (FP32 95.2) |
+
+- **Quantization costs 0.12 points against our own FP32**, at fewer average bits than
+  Tab.VI's 2.74. On that measure the result matches the paper's claim.
+- **Our absolute accuracy is 2 points below Tab.VI**, because our FP32 model is 1.5 points
+  below theirs (93.7 vs 95.2). The likely cause is the Q-12 single-W GraphSage, which has no
+  separate self weight and no concat. Standard GraphSAGE-mean reaches about 95 on Reddit
+  with them. We have not tested this. On Cora the same simplification came out 2 points
+  *above* Tab.VI, so the direction is dataset-dependent. Tab.VI's MEGA (95.6) is also above
+  its own FP32 (95.2), which our runs never show on Reddit.
+- **Integer partial sums:** max |psum| is 182 on both layers and all seeds, far inside
+  16 bits (Q-25), even though Reddit is the dataset with hub nodes. Sampling caps the
+  in-degree at 26.
+- **Q-11 on Reddit:** GraphSage's normalization is t = 1/d into the Encoder and s = 1 (no
+  source factor), so fold and per_source compute the same thing. The Q-11 choice is a GCN
+  question and cannot be reconfirmed with Tab.VI's Reddit model, which is GraphSage only.
+- Not run: 10 seeds (std is already 0.02 over 3), GCN/GIN on Reddit (not in Tab.VI), a
+  transductive variant.
+
 ## Known limitations / next steps
 
 - **b convergence:** Adam moves b by about `--lr-bits` per step, so 200 epochs allow about 2 bits
@@ -429,7 +477,8 @@ neighbors with a single W, hidden 256. q_test %, avg bits = `avg_bits_sparse`:
   end (check the `mem` log lines). Use more `--epochs-qat` or a higher `--lr-bits` if needed.
 - **λ / M_target sweep (Q-13):** with the default learned α (3 seeds, 2026-11-16 "Fidelity
   check"): PubMed beats Tab.VI at λ = 1e-6, Cora matches its accuracy at λ = 1e-5 but with
-  more bits, CiteSeer is 1–3 points short. Not tuned further yet; no 10-seed runs yet. The
+  more bits, CiteSeer is 1–3 points short. Reddit GraphSage (λ = 1e-9) is 2 points below Tab.VI
+  in absolute terms but only 0.12 below our FP32. Not tuned further yet; no 10-seed runs yet. The
   MSE re-fit option matched Tab.VI on all three at λ = 1e-6 (10 seeds; 2026-11-15).
 - **Scope:** GCN, GIN and GraphSage (Q-12). Reddit is loaded from DGL's S3 bucket (Tab.II
   sizes reproduced); NELL is loaded (sparse X^(0), PyG construction, Tab.II sizes
