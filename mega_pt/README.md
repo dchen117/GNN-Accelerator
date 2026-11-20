@@ -137,6 +137,7 @@ Outputs go to `runs/<name>/`:
 | `metrics.py` | Accuracy, average-bits definitions (Q-15), memory, partial-sum / lost-B checks |
 | `train.py` | CLI: pretraining → calibration → QAT, multiple seeds, results JSON |
 | `ptq_frontier.py` | Debug: PTQ accuracy vs fixed per-layer bitwidth (no QAT), MSE clip per b |
+| `hw_stats.py` | Simulator design numbers from a saved model (`train.py --save-model`): integer-only reference forward (`int_forward`, the computation the hardware does, Q-16), fixed-point scale formats, accumulator ranges (Q-22), BSE utilization of the two tile-feeding schemes (Q-23). `python -m mega_pt.hw_stats runs/hw/<run>` |
 
 ## Metrics in `results.json`
 
@@ -517,6 +518,64 @@ degree-dependent bits). Raw per-run numbers: `runs/ext/*/results.json`.
   datasets' published baselines, which use deeper models with residuals.
 - Integer partial sums stay at or below 479 (16 bits is ample).
 - Not run: 10 seeds/splits, residual variants, deeper models.
+
+### 2026-11-20 — Simulator design numbers (`hw_stats.py`), seed 0, one model each
+
+Purpose: back the Q-16, Q-22 and Q-23 decisions in `docs/mega-kb/04-open-questions.md` with
+measurements. Models were trained with the defaults at λ = 1e-5 (Cora GCN/GIN/GraphSage, GIN
+CiteSeer), 1e-6 (GCN CiteSeer/PubMed) and 1e-7 (GIN Amazon-Ratings), `--save-model`; outputs
+are in `runs/hw/<run>/hw_stats.json`.
+
+**Integer-only reference and the scale format (Q-16)**, test accuracy (%):
+
+| Model | fake-quant | integer, exact scales | prediction agreement | 8-bit | 12-bit | 16-bit | dyadic 6-bit | dyadic 8-bit |
+|---|---|---|---|---|---|---|---|---|
+| GCN Cora | 81.2 | 81.2 | 1.0000 | 81.3 | 81.2 | 81.2 | 81.5 | 81.4 |
+| GCN CiteSeer | 68.2 | 68.2 | 1.0000 | 67.6 | 68.2 | 68.2 | 67.5 | 68.2 |
+| GCN PubMed | 80.5 | 80.5 | 0.9999 | 80.2 | 80.6 | 80.5 | 80.2 | 80.4 |
+| GIN Cora | 76.7 | 76.7 | 1.0000 | 76.3 | 76.6 | 76.7 | 76.6 | 76.3 |
+| GIN CiteSeer | 65.4 | 65.4 | 1.0000 | 64.6 | 65.1 | 65.4 | 65.4 | 65.2 |
+| GraphSage Cora | 80.9 | 80.9 | 1.0000 | 81.2 | 80.9 | 81.0 | 81.0 | 81.2 |
+| GIN Amazon-Ratings | 40.2 | 40.2 | 0.9994 | 40.5 | 40.2 | 40.3 | 40.7 | 39.9 |
+
+- **What the columns mean:**
+  - "8/12/16-bit": every factor table (α′_d, c_j, e_d, γ_j) is stored as unsigned fixed
+    point with one binary point per table.
+  - "dyadic k-bit": each entry has its own k-bit mantissa and shift.
+- **The integer reference reproduces the fake-quant model** (it is the bit-exact target for
+  the simulator).
+- **16-bit tables are exact to within ±0.1**, and 12 bits stays within 0.3. Decision:
+  16-bit (Q-16).
+- **Table ranges are narrow:** each table spans at most 6.6 octaves (log2 max/min).
+
+**Accumulators and BSE utilization (Q-22, Q-23).** Per layer input: L0 = X⁽⁰⁾, L1 = hidden.
+"Running max" is the largest |value| the row accumulator ever holds; "tile" is one tile
+pass of ≤ 32 non-zeros. Cycles are per node per 32-column output block; util = useful BSE
+cycles / available.
+
+| Model | Layer | density | mean bits | running max | tile max | AU psum max | slice cyc / util | nnz, scan 128 | nnz, scan 256 |
+|---|---|---|---|---|---|---|---|---|---|
+| GCN Cora | L0 | 0.013 | 2.00 | 129 | 126 | 394 | 20.7 / 0.06 | 12.0 / 0.09 | 6.0 / 0.19 |
+| | L1 | 0.690 | 3.66 | 1,878 | 878 | 340 | 12.6 / 0.80 | 11.8 / 0.86 | 11.8 / 0.86 |
+| GCN CiteSeer | L0 | 0.009 | 2.00 | 330 | 330 | 170 | 47.8 / 0.04 | 29.0 / 0.07 | 15.0 / 0.13 |
+| | L1 | 0.696 | 3.23 | 911 | 478 | 123 | 11.3 / 0.80 | 10.5 / 0.86 | 10.5 / 0.86 |
+| GCN PubMed | L0 | 0.066 | 2.00 | 128 | 101 | 314 | 8.0 / 0.26 | 4.0 / 0.51 | 3.1 / 0.67 |
+| | L1 | 0.608 | 2.84 | 1,256 | 647 | 291 | 9.2 / 0.75 | 8.0 / 0.86 | 8.0 / 0.86 |
+| GIN Cora | L1 | 0.715 | 3.68 | 1,294 | 659 | 335 | 13.2 / 0.79 | 12.3 / 0.85 | 12.3 / 0.85 |
+| GraphSage Cora | L1 | 0.659 | 3.13 | 2,735 | 765 | 132 | 21.5 / 0.77 | 18.0 / 0.92 | 18.0 / 0.92 |
+| GIN Amazon-Ratings | L0 | 0.722 | 2.01 | 755 | 296 | 186 | 21.4 / 0.64 | 14.6 / 0.93 | 14.6 / 0.93 |
+| | L1 | 0.281 | 2.20 | 875 | 468 | 236 | 4.1 / 0.60 | 3.5 / 0.70 | 3.5 / 0.70 |
+
+- **Every measured value fits the worst-case-safe widths** of Q-22 (16-bit Shifter-Acc,
+  32-bit Tile Accumulator) and the 16-bit AU sums, with large margins.
+- **Feeding tiles by non-zeros ("nnz") beats fixed 32-feature slices everywhere.**
+  - Hidden layers gain 5–15 points of utilization.
+  - Sparse bag-of-words X⁽⁰⁾ gains 2–4× in cycles, once the bitmap scan is 256 bits/cycle.
+  - At 128 bits/cycle the scan limits X⁽⁰⁾. Hidden layers (≤ 256 features) are never
+    scan-bound at 256.
+- **Low X⁽⁰⁾ utilization is intrinsic**: Cora averages 18 non-zeros out of 1,433 features,
+  but the decoder still has to scan the whole bitmap.
+- Not measured here: Reddit (dense standardized features, 602-wide).
 
 ## Known limitations / next steps
 

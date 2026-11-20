@@ -1,7 +1,8 @@
 # 04 — Open Questions, Gaps, and Inconsistencies
 
-**Status (2026-11-17):** Q-01–Q-15 have decisions (Q-11 decided as fold on Cora + NELL; Reddit, which is GraphSage-only, cannot test it). GCN matches Tab.VI on Cora, CiteSeer and PubMed (Q-04 amended: MSE clip init + re-fit). Q-16 onward are
-open. The PyTorch model implementing them is in `mega_pt/`.
+**Status (2026-11-20):** Q-01–Q-15 have decisions (Q-11 decided as fold on Cora + NELL; Reddit, which is GraphSage-only, cannot test it). GCN matches Tab.VI on Cora, CiteSeer and PubMed (Q-04 amended: MSE clip init + re-fit). Q-16–Q-30 (simulator) were walked
+through with the user on 2026-11-20. Entries marked **PROPOSED** await confirmation: Q-23 feeding,
+Q-24, Q-25, Q-27 batching, Q-28, Q-29 and the new Q-35. Q-31 onward are open. The PyTorch model implementing them is in `mega_pt/`.
 
 Each entry lists what the paper says (with citations), what is missing or conflicting, and
 which implementation path it blocks:
@@ -363,7 +364,33 @@ should say which kind it is: filling a gap, or departing from a stated detail.
   (p.8).
 - Missing: the unit that multiplies by α_i β_j, the scale format (FP? fixed-point?), and
   whether rescale and requantize are merged into one multiplier.
-- Decision: —
+- Decision: **Scales are FP32 in training and fixed point in hardware. There are two requantization
+  points, and each multiplies an integer by a degree-table factor and a column factor.**
+  (2026-11-20; the user chose fixed point and offline c_j, and we chose the format.)
+  - **Combination rescale:** B̄_ij = clip(round(acc_ij · α′_{d_i} · c_j), ±7).
+    - acc = X̄_i·W̄_{:,j} is the integer from the Tile Accumulator (Q-22).
+    - α′_d = α_d·s_d: the GCN fold source factor d^(−1/2) (Q-11) is folded into the degree
+      table. It is 1 for GIN and GraphSage.
+    - c_j = β_j/γ_j is computed offline (user).
+    - Unit: 32 lanes, one per C-PE output column, after the Tile Accumulator, with two
+      multipliers per lane.
+  - **Encoder:** X̄′_ij = clip(round(ReLU(psum_ij) · e_{d_i} · γ_j), 0..qmax_{d_i}).
+    - e_d = t_d / α^(l+1)_d: GCN t = d^(−1/2), GraphSage t = 1/d, GIN t = 1.
+  - **Last layer:** logits = psum·γ_j, written out with no ReLU and no quantization (Q-10).
+    t_i is dropped because a positive per-row factor does not change the argmax.
+  - **Format (ours, measured):** 16-bit unsigned values with one binary point per table, set by
+    a per-table shift register. Rounding is round-half-away (Eq.(2)), applied once after both
+    multiplies, which run at full width.
+    - Measurement: the integer-only reference in `mega_pt/hw_stats.py` (`int_forward`)
+      reproduces the fake-quant model's predictions (agreement ≥ 0.9999 on 6 models).
+    - With 16-bit tables it is exact on all of them; 12 bits stays within 0.6 points; 8 bits
+      loses up to 0.8.
+    - Each table spans ≤ 6.6 octaves, so a shared binary point still leaves ≥ 9 significant
+      bits for the smallest entry.
+    - A per-entry mantissa + shift ("dyadic") was no better, so it is not used.
+    - Numbers: `mega_pt/README.md`, 2026-11-20.
+  - **Fidelity:** this fills a gap; the paper says only "scales from the Weight Buffer" (p.8).
+    The combination rescale unit is not listed in Tab.IV, so we count it as ours.
 
 ## B. Hardware — storage format
 
@@ -371,7 +398,12 @@ should say which kind it is: filling a gap, or departing from a stated detail.
 - Says: (short, medium, long) = (64, 128, 192) bits (p.6 §V-B). Header = Mode 2b + Bitwidth 3b.
 - [DERIVED] In Fig.9(d), the length labels (8/20/4 bits) cover Val Array + padding only.
 - Missing: explicit statement for the 64/128/192 values.
-- Decision: —
+- Decision: **64/128/192 are total package lengths, including the 5-bit header**, so the Val
+  Array holds at most 59/123/187 bits. (2026-11-20, user.)
+  - Why: every package is then a multiple of 8 bytes, so packages stored back to back stay
+    byte-aligned (Q-19).
+  - Trade-off: Fig.9(d)'s labels count the Val Array only; we treat the figure as schematic.
+    This fills a gap, since the text does not state it.
 
 ### Q-18 — Mode selection rule and encoding `[SIM]` affects-fidelity
 - Says: Mode 00/01/10 = short/medium/long (p.6). Selected "based on the sparsity and
@@ -381,7 +413,15 @@ should say which kind it is: filling a gap, or departing from a stated detail.
   (medium) (p.6).
 - Missing: the exact rule (smallest class that fits?), the meaning of code `11`, and whether a
   package can close early to pick a shorter mode.
-- Decision: —
+- Decision: **Greedy packing as stated on p.8, and Mode = the smallest length that fits.**
+  (2026-11-20, user.)
+  - The package register takes successive non-zeros until either the next value would exceed
+    187 bits or the next node's bitwidth differs.
+  - Mode is then the smallest of 64/128/192 total that holds 5 + k·b bits, and the rest is
+    zero-padded.
+  - Code `11` is unused (reserved).
+  - The Package1 text/figure conflict is moot: the rule decides.
+  - A full package holds 93, 62, 46, 37, 31, 26 and 23 values at b = 2…8.
 
 ### Q-19 — Addressing nodes, bitmaps, and spanning `[SIM]` blocking
 - Says: per-node bitmaps are stored separately from packages (p.6). Packages hold successive
@@ -391,12 +431,30 @@ should say which kind it is: filling a gap, or departing from a stated detail.
 - Missing: the per-node offset/pointer scheme, how the Decoder finds where node i starts, the
   bitmap memory layout (and whether bitmaps count in the CR/memory numbers), and DRAM
   alignment.
-- Decision: —
+- Decision: (2026-11-20; the user chose the bitmap + counter, contiguous byte-aligned packages and
+  bitmaps in the memory numbers; we chose the layout details.)
+  - **Packages:** one contiguous byte stream per layer. All lengths are multiples of 8 bytes.
+  - **Bitmaps:** a separate contiguous array, F bits per node, padded to a multiple of 32 bits
+    (ours: whole words for the decoder; at most 31 bits wasted per node).
+  - **Finding node i:** nodes are read in ID order.
+    - The Decoder takes popcount(bitmap_i) values and keeps a counter of the values left in
+      the current package.
+    - So a node can span packages, and a package can hold several nodes.
+    - There are no per-node pointers. Ours: one start pointer (package byte offset, value
+      index) per subgraph, used to restart a stream or prefetch.
+  - **Memory / CR (user):** count packages (headers and padding included) and bitmaps.
+    - Report the *stored* bits per element and CR_stored = 32/that, next to the
+      Tab.VI-comparable values-only numbers (Q-15).
+  - **Consequence [DERIVED]:** the bitmap costs 1 bit per feature, which dominates sparse inputs.
+    - Cora X⁽⁰⁾: 1,440 bitmap bits vs about 36 value bits per node.
+    - NELL X⁽⁰⁾: 7.5 KB of bitmap per node, 482 MB in total.
+    - So X⁽⁰⁾'s stored CR is ≤ 32 by construction. This is MEGA's stated format (bitmaps per
+      node, p.6), so we report it and do not fix it.
 
 ### Q-20 — Fig.9(b) Node1 bitmap `minor`
 - [DERIVED] Node1 = 01 10 00 11 00 → non-zero pattern 11010, but Fig.9(b) shows 11011 (p.6). The
   other three rows match. Likely a figure error. Doesn't affect implementation.
-- Decision: —
+- Decision: **Figure error; ignore.** (2026-11-20, user.)
 
 ## C. Hardware — compute engines
 
@@ -407,27 +465,81 @@ should say which kind it is: filling a gap, or departing from a stated detail.
   explicitly.
 - Missing: confirmation, and how F (e.g. 1433, 61278) is split into c-wide slices across tiles
   and passes.
-- Decision: —
+- Decision: **4 tiles, n = 8, m = 32, c = 32** (the [DERIVED] reading). (2026-11-20, user.)
+  - F > 128: several passes of at most 128 features per node (4 tiles × 32). How a tile's
+    slice is formed is the Q-23 proposal.
+  - Output columns (ours): m = 32 C-PEs produce 32 columns of B, so F2 takes F2/32 column
+    blocks (128 → 4, 256 → 8, ≤ 32 classes → 1).
+  - For each column block, the node's bit-planes are replayed from the Bit FIFO with that
+    block's weights.
 
 ### Q-22 — Bit-serial details `[SIM]` affects-fidelity
 - Says: (feature bits, shift bit) pairs; example (0101,0), (1011,1) (p.7).
   [DERIVED] LSB-plane first.
 - Missing: signed handling (two's complement MSB weight? sign-magnitude?), Shifter-Acc width,
   accumulator precision before requantization, and where the 4 tiles' partial sums are added.
-- Decision: —
+- Decision: (2026-11-20; the user asked for simple sign handling, and we chose the widths.)
+  - **Sign:** values are stored as b-bit two's complement (Q-06's levels fit).
+    - The Decoder emits bit-planes LSB first, and on the MSB plane the Shifter-Acc subtracts
+      (two's-complement weight −2^(b−1)).
+    - W̄ is 4-bit two's complement. A BSE ANDs the feature bit with the weight, which selects
+      the weight or 0.
+  - **Adder tree:** 8 × [−7, 7] gives [−56, 56], 7-bit signed.
+  - **Shifter-Acc:** one tile pass is ≤ 32 non-zeros at ≤ 8 bits.
+    - Worst case 32·7·127 = 28,448, so 16-bit signed can never overflow. Measured max 878.
+  - **Tile Accumulator** (ours, the separate component the user asked for):
+    - Per output lane: a 4-input adder of the tiles' 16-bit results, then a 32-bit
+      accumulator across passes.
+    - Worst case F·7·127; for NELL (F = 61,278) that is 5.4e7 < 2³¹, so it never overflows on
+      any of our datasets. Measured running max 2,735.
+    - Its output goes to the Rescale unit (Q-16).
+  - Why worst-case widths rather than measured ones: the extra width is cheap, and the
+    simulator then needs no overflow model for combination.
 
 ### Q-23 — Weight index generation and crossbar control `[SIM]` affects-fidelity
 - Says: Parallel Sum Unit converts the bitindex to W row indices (p.7, Fig.10(b)).
 - Missing: how many bitmap bits are processed per cycle, how n non-zeros are grouped per C-PE
   pass, and the tail case when the number of non-zeros isn't a multiple of n.
-- Decision: —
+- Decision: **Tail BSEs are disabled** (user). **How a tile's ≤ 32 non-zeros are chosen, and the
+  bitmap scan width: PROPOSED, awaiting confirmation** (2026-11-20).
+  - The two options measured (`mega_pt/hw_stats.py`, cycles per node per 32-column block,
+    BSE utilization):
+    - **slice:** tile t takes a fixed 32-feature slice. A pass costs max over tiles of
+      groups·b, and empty passes still cost 1 cycle.
+    - **nnz:** a pass takes the node's next ≤ 128 non-zeros, at any feature positions, split
+      evenly over the 4 tiles. The Weight Index Generator's indices fetch those W rows (Fig.10(b):
+      "indices drive weight loading").
+  - Hidden layers (55–70% dense): slice 75–80% utilization, nnz 82–92%.
+  - X⁽⁰⁾ of bag-of-words sets (1–7% dense):
+    - slice: 4–26% (Cora 20.7 cycles/node, CiteSeer 47.8).
+    - nnz: limited by the bitmap scan. Cora 12.0 at 128 bits/cycle and 6.0 at 256;
+      CiteSeer 29.0 and 15.0.
+  - **Proposal: nnz feeding with a 256-bit/cycle scan** (one Parallel Sum Unit over 256
+    bitmap bits, pipelined with compute).
+    - 256 = the largest hidden width (Tab.III, GraphSage), so hidden layers are never
+      scan-bound; only sparse X⁽⁰⁾ is. A wider scan helps only X⁽⁰⁾.
+  - Fidelity: the paper says "each tile is responsible for processing a slice of features in a
+    node" (p.6). nnz reads "slice" as a slice of the node's non-zero features. This differs from
+    the 32-feature-wide slices of Q-21, so it needs the user's confirmation.
 
 ### Q-24 — C-PE systolic timing `[SIM]` blocking
 - Says: C-PEs are split into two groups; features flow left → right; Fig.11 shows m=2, n=2 over
   4 cycles (p.7).
 - Missing: the general schedule for m = 32 (16 per group?), pipeline fill/drain, and cycles per
   row as a function of (non-zeros, bitwidth, F2).
-- Decision: —
+- Decision: **PROPOSED (ours), 2026-11-20.**
+  - **Groups:** the 32 C-PEs form two groups of 16 (A, B). The crossbar delivers
+    8 rows × 16 weights × 4 bits per cycle, enough for one group.
+  - **Timing:** for a group of ≤ 8 non-zeros, the crossbar loads group A at cycle t and group
+    B at t+1, and bit-planes are forwarded A→B.
+    - Each C-PE keeps its weights for b cycles, one bit-plane per cycle.
+    - Since b ≥ 2, the crossbar alternates A/B and is never the bottleneck. That is the
+      paper's stated reason for the 2-bit minimum halving weight bandwidth (p.7).
+  - **Steady state:** one 8-non-zero group per b cycles, per tile, per 32-column block.
+  - **Node cost per column block:** Σ over passes of max over tiles of (groups·b), bounded
+    below by the bitmap scan (Q-23).
+  - **Fill/drain:** 1 cycle (crossbar) + 1 (group skew) + 1 (adder tree) + 1 (Shifter-Acc).
+    Paid once per sweep if nodes stream back to back.
 
 ### Q-25 — Aggregation Unit operation `[SIM]` blocking
 - Says: 256 AUs, outer product, CSC, 16-bit partial sums, free AUs can serve other nodes
@@ -435,14 +547,41 @@ should say which kind it is: filling a gap, or departing from a stated detail.
 - Missing: the AU-to-feature mapping when F2 = 128 or 256 vs 256 AUs, 16-bit overflow handling,
   mean (division) for GraphSage, the edge-weight broadcast rate, and Aggregation Buffer
   capacity management (128 KB) for large subgraphs.
-- Decision: —
+- Decision: **PROPOSED (ours), 2026-11-20.**
+  - **Mapping:** outer product over the source's CSC column. Each cycle processes
+    k = ⌊256/F2′⌋ edges of the current source, where F2′ is F2 rounded up to a power of 2:
+    - 128 → 2 edges/cycle;
+    - 256 → 1;
+    - 7 classes → 32.
+  - **A is binary under fold (Q-11).** AUs add B̄ into the destination's 16-bit partial sum.
+    The multiplier is unused but kept for the per_source fallback. CSC stores indices only.
+  - **Overflow:** saturating 16-bit adds. The simulator counts saturations. Measured max 479.
+  - **GraphSage mean:** 1/d sits in the Encoder factor e_d (Q-12, Q-16), so there is no divider.
+  - **Capacity:** the Aggregation Buffer is 128 KB in ping-pong, so 64 KB is active.
+    - Destination capacity = 64 KB / (2 B · F2): 256 nodes at F2 = 128, 128 at 256.
+    - This sets the subgraph size (Q-27).
+  - **Completion:** a subgraph's destinations finish together, after its internal and
+    external sources have been processed. The Encoder then drains them in node order.
 
 ### Q-26 — Encoder parameter lookup `[SIM]` affects-fidelity
 - Says: QN units quantize using scales from the Weight Buffer, apply ReLU, make the bitindex,
   and do greedy packing (p.8).
 - Missing: how a node's degree → (α, b) is looked up (is the degree stored per node? where?)
   and the throughput of packing.
-- Decision: —
+- Decision: (2026-11-20; the user chose degree in metadata and a degree-indexed table in the
+  Weight Buffer; we chose the details.)
+  - **Per-node metadata:** a 16-bit index into a *compacted* per-layer degree table that lists
+    only the degrees present (Cora 37 entries, NELL 281, sampled GraphSage ≤ 26).
+    - An index rather than the raw degree avoids a lookup CAM.
+    - It is streamed with the node's data from DRAM.
+  - **Degree-table entry:** b (3 bits), α′_d (16 bits) and e_d (16 bits), plus a per-table
+    shift (Q-16).
+  - **Column tables:** c_j and γ_j, 16 bits each.
+  - **Size:** all tables fit easily in the Weight Buffer; Cora's are about 1 KB in total.
+  - **Packing (user):** the 32 QN units handle 32 features per cycle: quantize, ReLU, produce
+    32 bitmap bits, and append the non-zeros (≤ 32·b bits) to the package register.
+    - F2 = 128 takes 4 cycles per node.
+    - A package is emitted when full or when the bitwidth changes (Q-18).
 
 ## D. Hardware — scheduling and memory system
 
@@ -453,7 +592,37 @@ should say which kind it is: filling a gap, or departing from a stated detail.
   sizes, the number of METIS partitions per dataset, and the reload order when reading spilled
   regions back. Alg.1 L4 (partition inside the per-node routine) is presentational.
 - [DERIVED] Head-only matching needs nodes to arrive in ascending ID order (see Q-28).
-- Decision: —
+- Decision: (2026-11-20; the user decided the parts below; the batching method is **PROPOSED**.)
+  - **Order:** FIFO refill keeps ascending order (user). Ours: when a FIFO drops to 4 entries,
+    load the next 4 eIDs from the Edge Buffer.
+  - **Regions:** equal sized (user): 32 KB / 16 = 2 KB, which is 32 nodes at F2 = 128 (4-bit).
+    - A full region spills to DRAM, so subgraph k's spilled rows are contiguous there.
+    - They are read back in order when k is aggregated.
+  - **Partitioning:** Alg.1 L4 is presentational; METIS runs offline (user).
+  - **METIS partitions (ours):** SubNum = ⌈N / capacity⌉ with the capacity from Q-25:
+    Cora 11, CiteSeer 13, PubMed 78, NELL 257, Reddit about 1,821, Roman-Empire 89,
+    Amazon-Ratings 96, Paris 446.
+    - Nodes are relabeled so each subgraph is a contiguous ID range. Ascending-order matching
+      and contiguous internal reads need this.
+  - **Batching when SubNum > 16 (user: batch, with per-batch metadata): PROPOSED, needs a
+    choice.**
+    - **B1, re-stream:** condense batch 0 on the fly. Condense each later batch by re-reading
+      the combined rows from DRAM sequentially.
+      - Cost: (⌈SubNum/16⌉ − 1) × |B| extra DRAM reads per layer. PubMed about 5 MB;
+        Reddit about 3.4 GB, which is too much.
+    - **B2, time-multiplexed matching:** the 16 comparators cycle over all batches. Each
+      batch's FIFO heads are kept in the Edge Buffer, and per-batch metadata holds the FIFO
+      base addresses.
+      - Cost: no extra traffic, but ⌈SubNum/16⌉ matching cycles per node (PubMed 5, NELL 17,
+        Reddit 114).
+      - It stalls combination wherever that exceeds a node's combination time (about 10–20
+        cycles).
+    - **B3, per-node target list:** offline, each node gets the list of subgraphs that need
+      it, read from the Edge Buffer, and Condense appends to those regions directly.
+      - Same DRAM layout and traffic as Alg.1, and no comparisons.
+      - Departs from Alg.1's FIFO/compare mechanism, though not from its result.
+    - **Recommendation: B2.** It keeps Alg.1's hardware, and the simulator reports the cost.
+      Reddit is the worst case.
 
 ### Q-28 — Global schedule / phase fusion `[SIM]` blocking
 - Says: subgraphs are aggregated one after another. Combined nodes go to aggregation and also
@@ -462,20 +631,59 @@ should say which kind it is: filling a gap, or departing from a stated detail.
 - Missing: the order in which nodes are combined (all nodes before/while aggregating subgraph
   1?), how combination of later subgraphs interleaves, the granularity of layer fusion, and
   the Controller's policy.
-- Decision: —
+- Decision: **PROPOSED (ours), 2026-11-20.** Nodes are combined in node order (user), and the
+  Controller runs a static sweep schedule computed offline.
+  - **Sweep 0:** combine layer 0 for all nodes in ID (= subgraph) order. Condense fills the
+    Sparse regions.
+  - **Sweep l (1 … L−1):** for each subgraph k:
+    - aggregate layer l−1, with internal sources from the Combination Buffer/DRAM and external
+      ones from k's Sparse region;
+    - the Encoder then feeds layer l's combination of k's nodes node by node, which is the
+      fusion of p.6;
+    - Condense runs for layer l.
+  - **Final sweep:** aggregate layer L−1 and write the logits.
+  - **Overlap:** ping-pong buffers overlap subgraph k's combination with subgraph k+1's
+    aggregation. Granularity is the node inside a subgraph, and the subgraph for overlap.
+  - Why aggregation of layer l cannot fuse with combination of the *same* layer: subgraph k's
+    external sources may be combined anywhere in the sweep.
 
 ### Q-29 — DRAM model details `[SIM]` affects-fidelity
 - Says: HBM1.0, 256 GB/s, Ramulator, DRAM energy "following the methodology in [56]"
   (p.9 §VI-A-3). The 128B access granularity is used as an example (p.8).
 - Missing: the Ramulator config (channels, timing), the address mapping of packages, bitmaps,
   edges, and Sparse Buffer regions, and the per-access energy values.
-- Decision: —
+- Decision: **Our own choice, applied identically to MEGA and to our design** (2026-11-20, user).
+  **PROPOSED:**
+  - Ramulator 2.0 HBM: 1 stack, 8 channels × 128 bit, 256 GB/s, FR-FCFS.
+  - Each data stream (packages, bitmaps, metadata, W̄, CSC, eIDs, Sparse regions, B rows,
+    outputs) gets its own contiguous address region.
+  - Energy: a fixed pJ/bit per access, taken from one published HBM figure (to be chosen and
+    cited).
 
 ### Q-30 — Simulator availability `[SIM]` affects-fidelity
 - Says: "We implement cycle-accurate simulators ... validated with the HDL design at the cycle
   level" (p.9).
 - Missing: no code or artifact release is stated.
-- Decision: —
+- Decision: **None is released; we build our own simulator** (user, 2026-11-20).
+  - Functional check: the simulator's integer outputs must match the integer-only reference
+    `mega_pt/hw_stats.int_forward` bit for bit.
+
+### Q-35 — W̄ larger than the Weight Buffer `[SIM]` blocking
+- Says: Weight Buffer 48 KB (Tab.IV). Weights are "prefetched from DRAM into ... Weight Buffer"
+  (p.6).
+- [DERIVED] At 4 bits, W⁽⁰⁾ is larger than the buffer for Cora (90 KB), CiteSeer (231 KB), NELL
+  (3.8 MB) and Reddit-GraphSage (75 KB). It fits for PubMed, the extra datasets and every
+  hidden layer.
+- Missing: the dataflow when W does not fit.
+- Decision: **PROPOSED (ours), 2026-11-20:** the Weight Buffer acts as a row cache of W̄.
+  - Nodes are the outer loop.
+  - Rows a node needs are fetched from DRAM by index; the indices are known early from the
+    bitmap, so they can be prefetched.
+  - When W fits, it simply stays resident. The simulator measures the traffic.
+  - Alternatives:
+    - W row blocks as the outer loop: 32-bit partial B rows for every node would go to DRAM
+      between blocks.
+    - Node blocks: the same as the row cache, only coarser.
 
 ## E. Evaluation reporting
 
