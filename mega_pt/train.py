@@ -124,6 +124,9 @@ def parse_args(argv=None):
                         "pretraining on Reddit when sweeping λ. The RNG states are saved too, so a "
                         "cached run continues exactly like an uncached one")
     p.add_argument("--log-every", type=int, default=50)
+    p.add_argument("--save-model", action="store_true",
+                   help="save the trained quantized model per seed (model_seed<s>.pt in the run "
+                        "dir): input for mega_pt.hw_stats and the simulator")
     p.add_argument("--run-name", default=None)
     p.add_argument("--out-dir", default="runs")
     return p.parse_args(argv)
@@ -309,6 +312,12 @@ def main(argv=None):
             row.update(quant_report(model, g.x, ops))
             with open(os.path.join(out_dir, f"bits_seed{seed}.json"), "w") as f:
                 json.dump(bit_tables(model), f)
+            if args.save_model:
+                # Everything needed to rebuild the exact model and graph sample:
+                # hw_stats.load_run() re-creates dims / max_degree / ops from args + seed.
+                torch.save({"state": model.state_dict(), "dims": dims, "max_degree": max_degree,
+                            "args": vars(args), "seed": seed},
+                           os.path.join(out_dir, f"model_seed{seed}.pt"))
         row["seconds"] = round(time.time() - t0, 1)
         per_seed.append(row)
         print(f"seed {seed}: " + ", ".join(
