@@ -81,7 +81,9 @@ def to_fixed(v: torch.Tensor, fmt: str | None) -> torch.Tensor:
     k = int(fmt[2:])
     v = v.double()
     if fmt.startswith("fx"):
-        f = k - math.ceil(math.log2(v.max().item() + 1e-300))      # fractional bits
+        # fractional bits: largest entry < 2^k. (floor+1, not ceil: an exact power of two
+        # would otherwise round to 2^k, a (k+1)-bit code. megasim.program mirrors this.)
+        f = k - (math.floor(math.log2(v.max().item())) + 1)
         return torch.floor(v * 2.0 ** f + 0.5) / 2.0 ** f
     e = torch.floor(torch.log2(v)) - (k - 1)                      # per-entry exponent
     return torch.floor(v / 2.0 ** e + 0.5) * 2.0 ** e

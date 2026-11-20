@@ -708,6 +708,8 @@ should say which kind it is: filling a gap, or departing from a stated detail.
 - Decision: **None is released; we build our own simulator** (user, 2026-11-20).
   - Functional check: the simulator's integer outputs must match the integer-only reference
     `mega_pt/hw_stats.int_forward` bit for bit.
+  - **Status 2026-11-20:** the functional model (`megasim/`, design in
+    `docs/simulator/00-design.md`) matches it bit for bit on all 8 saved models.
 
 ### Q-35 — W̄ larger than the Weight Buffer `[SIM]` blocking
 - Says: Weight Buffer 48 KB (Tab.IV). Weights are "prefetched from DRAM into ... Weight Buffer"
