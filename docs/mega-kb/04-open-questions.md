@@ -1,8 +1,7 @@
 # 04 — Open Questions, Gaps, and Inconsistencies
 
 **Status (2026-11-20):** Q-01–Q-15 have decisions (Q-11 decided as fold on Cora + NELL; Reddit, which is GraphSage-only, cannot test it). GCN matches Tab.VI on Cora, CiteSeer and PubMed (Q-04 amended: MSE clip init + re-fit). Q-16–Q-30 (simulator) were walked
-through with the user on 2026-11-20. Entries marked **PROPOSED** await confirmation: Q-23 feeding,
-Q-24, Q-25, Q-27 batching, Q-28, Q-29 and the new Q-35. Q-31 onward are open. The PyTorch model implementing them is in `mega_pt/`.
+through with the user on 2026-11-20. Entries marked **PROPOSED** await confirmation: Q-23 feeding, Q-24 and Q-27 batching. Q-31 onward are open. The PyTorch model implementing them is in `mega_pt/`.
 
 Each entry lists what the paper says (with citations), what is missing or conflicting, and
 which implementation path it blocks:
@@ -505,7 +504,7 @@ should say which kind it is: filling a gap, or departing from a stated detail.
   - The two options measured (`mega_pt/hw_stats.py`, cycles per node per 32-column block,
     BSE utilization):
     - **slice:** tile t takes a fixed 32-feature slice. A pass costs max over tiles of
-      groups·b, and empty passes still cost 1 cycle.
+      waves·b, and empty passes still cost 1 cycle.
     - **nnz:** a pass takes the node's next ≤ 128 non-zeros, at any feature positions, split
       evenly over the 4 tiles. The Weight Index Generator's indices fetch those W rows (Fig.10(b):
       "indices drive weight loading").
@@ -527,18 +526,30 @@ should say which kind it is: filling a gap, or departing from a stated detail.
   4 cycles (p.7).
 - Missing: the general schedule for m = 32 (16 per group?), pipeline fill/drain, and cycles per
   row as a function of (non-zeros, bitwidth, F2).
-- Decision: **PROPOSED (ours), 2026-11-20.**
-  - **Groups:** the 32 C-PEs form two groups of 16 (A, B). The crossbar delivers
-    8 rows × 16 weights × 4 bits per cycle, enough for one group.
-  - **Timing:** for a group of ≤ 8 non-zeros, the crossbar loads group A at cycle t and group
-    B at t+1, and bit-planes are forwarded A→B.
-    - Each C-PE keeps its weights for b cycles, one bit-plane per cycle.
-    - Since b ≥ 2, the crossbar alternates A/B and is never the bottleneck. That is the
+- Decision: **PROPOSED (ours), 2026-11-20; under discussion.**
+  - **Terms:** a tile's BSEs form an 8 × 32 array: n = 8 BSE rows (non-zeros) × m = 32
+    C-PEs (output columns).
+    - A **wave** is ≤ 8 non-zeros of the node, one per BSE row. All 32 C-PEs process the same
+      wave, each against its own weight column, so one wave yields 8 products per output
+      column per bit-plane.
+    - The paper's two "groups" are the two halves of the C-PEs (16 + 16), not sets of
+      features.
+  - **Weight loading:**
+    - The crossbar outputs n × (m/2 × 4 bits) = 8 rows × 16 weights per cycle: one wave's
+      weights for half of the C-PEs.
+    - Cycle t: the left half (C-PEs 1–16) gets the wave's weights and its first bit-plane.
+    - Cycle t+1: the right half gets the weights, and the *same* bit-plane is forwarded to it
+      from the left half (Fig.11). Meanwhile the left half reuses its weights on the next
+      bit-plane.
+    - So both halves process the same features, one cycle apart. Each C-PE keeps its weights
+      for b cycles.
+    - With b ≥ 2, the crossbar alternates halves and is never the bottleneck. That is the
       paper's stated reason for the 2-bit minimum halving weight bandwidth (p.7).
-  - **Steady state:** one 8-non-zero group per b cycles, per tile, per 32-column block.
-  - **Node cost per column block:** Σ over passes of max over tiles of (groups·b), bounded
+  - **Steady state:** one wave per b cycles per tile per 32-column block. A 32-non-zero tile
+    share is 4 waves.
+  - **Node cost per column block:** Σ over passes of max over tiles of (waves·b), bounded
     below by the bitmap scan (Q-23).
-  - **Fill/drain:** 1 cycle (crossbar) + 1 (group skew) + 1 (adder tree) + 1 (Shifter-Acc).
+  - **Fill/drain:** 1 cycle (crossbar) + 1 (half skew) + 1 (adder tree) + 1 (Shifter-Acc).
     Paid once per sweep if nodes stream back to back.
 
 ### Q-25 — Aggregation Unit operation `[SIM]` blocking
@@ -547,7 +558,7 @@ should say which kind it is: filling a gap, or departing from a stated detail.
 - Missing: the AU-to-feature mapping when F2 = 128 or 256 vs 256 AUs, 16-bit overflow handling,
   mean (division) for GraphSage, the edge-weight broadcast rate, and Aggregation Buffer
   capacity management (128 KB) for large subgraphs.
-- Decision: **PROPOSED (ours), 2026-11-20.**
+- Decision: **Ours, accepted by the user 2026-11-20.**
   - **Mapping:** outer product over the source's CSC column. Each cycle processes
     k = ⌊256/F2′⌋ edges of the current source, where F2′ is F2 rounded up to a power of 2:
     - 128 → 2 edges/cycle;
@@ -631,7 +642,7 @@ should say which kind it is: filling a gap, or departing from a stated detail.
 - Missing: the order in which nodes are combined (all nodes before/while aggregating subgraph
   1?), how combination of later subgraphs interleaves, the granularity of layer fusion, and
   the Controller's policy.
-- Decision: **PROPOSED (ours), 2026-11-20.** Nodes are combined in node order (user), and the
+- Decision: **Ours, accepted by the user 2026-11-20.** Nodes are combined in node order (user), and the
   Controller runs a static sweep schedule computed offline.
   - **Sweep 0:** combine layer 0 for all nodes in ID (= subgraph) order. Condense fills the
     Sparse regions.
@@ -653,7 +664,7 @@ should say which kind it is: filling a gap, or departing from a stated detail.
 - Missing: the Ramulator config (channels, timing), the address mapping of packages, bitmaps,
   edges, and Sparse Buffer regions, and the per-access energy values.
 - Decision: **Our own choice, applied identically to MEGA and to our design** (2026-11-20, user).
-  **PROPOSED:**
+  **Ours, accepted by the user 2026-11-20:**
   - Ramulator 2.0 HBM: 1 stack, 8 channels × 128 bit, 256 GB/s, FR-FCFS.
   - Each data stream (packages, bitmaps, metadata, W̄, CSC, eIDs, Sparse regions, B rows,
     outputs) gets its own contiguous address region.
@@ -675,7 +686,8 @@ should say which kind it is: filling a gap, or departing from a stated detail.
   (3.8 MB) and Reddit-GraphSage (75 KB). It fits for PubMed, the extra datasets and every
   hidden layer.
 - Missing: the dataflow when W does not fit.
-- Decision: **PROPOSED (ours), 2026-11-20:** the Weight Buffer acts as a row cache of W̄.
+- Decision: **The Weight Buffer acts as a row cache of W̄** (proposed by us, accepted by the user
+  2026-11-20).
   - Nodes are the outer loop.
   - Rows a node needs are fetched from DRAM by index; the indices are known early from the
     bitmap, so they can be prefetched.
