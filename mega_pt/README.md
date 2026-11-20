@@ -576,6 +576,12 @@ cycles / available.
 - **Low X⁽⁰⁾ utilization is intrinsic**: Cora averages 18 non-zeros out of 1,433 features,
   but the decoder still has to scan the whole bitmap.
 - Not measured here: Reddit (dense standardized features, 602-wide).
+- **GCN NELL (λ = 1e-7) collapsed** to 1.2% test accuracy: X⁽⁰⁾ kept on average 1 non-zero
+  per node. NELL QAT is known to be noisy (2026-11-15 notes). So its accuracy and range
+  numbers are not used.
+  - Its structural number still holds: with a 61,278-wide bitmap, X⁽⁰⁾ takes 240 scan cycles
+    per node at 256 bits/cycle (480 with fixed slices) against about 2 compute cycles.
+  - NELL's layer 0 is therefore bound entirely by bitmap scanning in MEGA's format (Q-19, Q-23).
 
 ## Known limitations / next steps
 
