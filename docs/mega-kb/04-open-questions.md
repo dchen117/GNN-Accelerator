@@ -1,7 +1,7 @@
 # 04 — Open Questions, Gaps, and Inconsistencies
 
 **Status (2026-11-20):** Q-01–Q-15 have decisions (Q-11 decided as fold on Cora + NELL; Reddit, which is GraphSage-only, cannot test it). GCN matches Tab.VI on Cora, CiteSeer and PubMed (Q-04 amended: MSE clip init + re-fit). Q-16–Q-30 (simulator) were walked
-through with the user on 2026-11-20. Entries marked **PROPOSED** await confirmation: Q-23 feeding, Q-24 and Q-27 batching. Q-31 onward are open. The PyTorch model implementing them is in `mega_pt/`.
+through with the user on 2026-11-20. All Q-16–Q-30 entries are decided, plus Q-35. Q-31 onward are open. The PyTorch model implementing them is in `mega_pt/`.
 
 Each entry lists what the paper says (with citations), what is missing or conflicting, and
 which implementation path it blocks:
@@ -465,8 +465,12 @@ should say which kind it is: filling a gap, or departing from a stated detail.
 - Missing: confirmation, and how F (e.g. 1433, 61278) is split into c-wide slices across tiles
   and passes.
 - Decision: **4 tiles, n = 8, m = 32, c = 32** (the [DERIVED] reading). (2026-11-20, user.)
-  - F > 128: several passes of at most 128 features per node (4 tiles × 32). How a tile's
-    slice is formed is the Q-23 proposal.
+  - F > 128: several passes per node. Under Q-23's non-zero feeding a pass is the node's next
+    ≤ 128 **non-zeros** (≤ 32 per tile), not 128 feature positions. c = 32 is the tile's
+    Weight Reg / crossbar input count.
+  - Confirmed 2026-11-20 with m = 32 C-PEs × n = 8 BSEs per tile. The user's first reading was
+    8 C-PEs × 32 BSEs; that would give m = 8, contradicting the crossbar's m/2 × 4 = 64 bits
+    and the Encoder's "#m = 32 QN units".
   - Output columns (ours): m = 32 C-PEs produce 32 columns of B, so F2 takes F2/32 column
     blocks (128 → 4, 256 → 8, ≤ 32 classes → 1).
   - For each column block, the node's bit-planes are replayed from the Bit FIFO with that
@@ -499,8 +503,14 @@ should say which kind it is: filling a gap, or departing from a stated detail.
 - Says: Parallel Sum Unit converts the bitindex to W row indices (p.7, Fig.10(b)).
 - Missing: how many bitmap bits are processed per cycle, how n non-zeros are grouped per C-PE
   pass, and the tail case when the number of non-zeros isn't a multiple of n.
-- Decision: **Tail BSEs are disabled** (user). **How a tile's ≤ 32 non-zeros are chosen, and the
-  bitmap scan width: PROPOSED, awaiting confirmation** (2026-11-20).
+- Decision: **Tail BSEs are disabled** (user). **Non-zero feeding with a 256-bit/cycle bitmap scan**
+  (proposed by us, accepted by the user 2026-11-20).
+  - **Decoders (ours):** one Decoder per tile, as Fig.8 shows.
+    - The node's bitmap and package stream are broadcast to all four.
+    - Each Decoder computes the same 256-bit prefix sums (the global rank of every non-zero)
+      and keeps only the ranks in its tile's share of the pass.
+    - Cost: four prefix-sum units instead of one shared dispatcher. Chosen because the paper
+      states a Decoder per tile.
   - The two options measured (`mega_pt/hw_stats.py`, cycles per node per 32-column block,
     BSE utilization):
     - **slice:** tile t takes a fixed 32-feature slice. A pass costs max over tiles of
@@ -519,14 +529,14 @@ should say which kind it is: filling a gap, or departing from a stated detail.
       scan-bound; only sparse X⁽⁰⁾ is. A wider scan helps only X⁽⁰⁾.
   - Fidelity: the paper says "each tile is responsible for processing a slice of features in a
     node" (p.6). nnz reads "slice" as a slice of the node's non-zero features. This differs from
-    the 32-feature-wide slices of Q-21, so it needs the user's confirmation.
+    the 32-feature-wide slices first assumed in Q-21; the user accepted it.
 
 ### Q-24 — C-PE systolic timing `[SIM]` blocking
 - Says: C-PEs are split into two groups; features flow left → right; Fig.11 shows m=2, n=2 over
   4 cycles (p.7).
 - Missing: the general schedule for m = 32 (16 per group?), pipeline fill/drain, and cycles per
   row as a function of (non-zeros, bitwidth, F2).
-- Decision: **PROPOSED (ours), 2026-11-20; under discussion.**
+- Decision: **Ours, accepted by the user 2026-11-20.**
   - **Terms:** a tile's BSEs form an 8 × 32 array: n = 8 BSE rows (non-zeros) × m = 32
     C-PEs (output columns).
     - A **wave** is ≤ 8 non-zeros of the node, one per BSE row. All 32 C-PEs process the same
@@ -603,7 +613,7 @@ should say which kind it is: filling a gap, or departing from a stated detail.
   sizes, the number of METIS partitions per dataset, and the reload order when reading spilled
   regions back. Alg.1 L4 (partition inside the per-node routine) is presentational.
 - [DERIVED] Head-only matching needs nodes to arrive in ascending ID order (see Q-28).
-- Decision: (2026-11-20; the user decided the parts below; the batching method is **PROPOSED**.)
+- Decision: (2026-11-20; the user and we decided the parts below as marked.)
   - **Order:** FIFO refill keeps ascending order (user). Ours: when a FIFO drops to 4 entries,
     load the next 4 eIDs from the Edge Buffer.
   - **Regions:** equal sized (user): 32 KB / 16 = 2 KB, which is 32 nodes at F2 = 128 (4-bit).
@@ -615,25 +625,45 @@ should say which kind it is: filling a gap, or departing from a stated detail.
     Amazon-Ratings 96, Paris 446.
     - Nodes are relabeled so each subgraph is a contiguous ID range. Ascending-order matching
       and contiguous internal reads need this.
-  - **Batching when SubNum > 16 (user: batch, with per-batch metadata): PROPOSED, needs a
-    choice.**
-    - **B1, re-stream:** condense batch 0 on the fly. Condense each later batch by re-reading
-      the combined rows from DRAM sequentially.
-      - Cost: (⌈SubNum/16⌉ − 1) × |B| extra DRAM reads per layer. PubMed about 5 MB;
-        Reddit about 3.4 GB, which is too much.
-    - **B2, time-multiplexed matching:** the 16 comparators cycle over all batches. Each
-      batch's FIFO heads are kept in the Edge Buffer, and per-batch metadata holds the FIFO
-      base addresses.
-      - Cost: no extra traffic, but ⌈SubNum/16⌉ matching cycles per node (PubMed 5, NELL 17,
-        Reddit 114).
-      - It stalls combination wherever that exceeds a node's combination time (about 10–20
-        cycles).
-    - **B3, per-node target list:** offline, each node gets the list of subgraphs that need
-      it, read from the Edge Buffer, and Condense appends to those regions directly.
-      - Same DRAM layout and traffic as Alg.1, and no comparisons.
-      - Departs from Alg.1's FIFO/compare mechanism, though not from its result.
-    - **Recommendation: B2.** It keeps Alg.1's hardware, and the simulator reports the cost.
-      Reddit is the worst case.
+  - **Batching when SubNum > 16: B2 with batch-minimum skipping** (ours, accepted by the user
+    2026-11-20).
+    - **Batches:** subgraphs are grouped 16 per batch.
+    - **Per-subgraph metadata** in the Edge Buffer, 12 B: head eID, read pointer into its
+      sorted eID list, and write pointer to its Sparse area in DRAM.
+    - **Per-batch register:** the smallest head eID among its 16 subgraphs.
+    - **Per combined node nID:**
+      - compare nID with the batch minimums (16 per cycle);
+      - only a batch whose minimum equals nID is loaded into the 16 FIFO heads/comparators,
+        matched (Alg.1 L7–L12), refilled and written back;
+      - its minimum is then recomputed (16-way min).
+      - Batch 0 can stay resident when SubNum ≤ 16, which is plain Alg.1.
+    - **Regions:** the 16 Sparse Buffer regions (2 KB each) are write-combining buffers.
+      Region r serves subgraphs r, r+16, … and flushes to that subgraph's contiguous DRAM area
+      when it fills or its subgraph changes. Each subgraph's external rows are still read back
+      as one contiguous stream.
+    - **Why skip instead of visiting every batch (measured, METIS via pymetis, ⌈N/256⌉·1.05
+      parts):** external (subgraph, node) pairs are few, at 0.01–1.14 per node.
+
+      | Dataset | Parts | Batches | External pairs per node | Batches with a match, per node |
+      |---|---|---|---|---|
+      | Cora | 12 | 1 | 0.36 | 0.27 |
+      | CiteSeer | 14 | 1 | 0.11 | 0.10 |
+      | PubMed | 81 | 6 | 0.89 | 0.57 |
+      | Amazon-Ratings | 101 | 7 | 0.21 | 0.18 |
+      | Roman-Empire | 93 | 6 | 0.01 | 0.01 |
+      | Paris | 469 | 30 | 0.15 | 0.14 |
+      | NELL | 270 | 17 | 1.14 | 0.88 |
+
+      - Visiting every batch for every node would move ⌈SubNum/16⌉ × 128 B of head metadata
+        (read + write) per node. On PubMed that is 768 B, against 57 B of external rows per
+        node: 13× more bytes than the data it reorders.
+      - With skipping, metadata moves only for the 0.01–0.88 batches per node that match,
+        about 2 B of on-chip SRAM per byte of row data the Condense step places. The
+        comparison is about 1 cycle per 16 batches (8 cycles for Reddit's ~114).
+    - **Whether Condense-Edge itself pays off** against fetching external rows directly
+      depends on the DRAM model: row-buffer locality, and access granularity vs the 64 B row.
+      It is MEGA's mechanism, so the baseline keeps it, and the simulator reports its traffic.
+    - Not measured: Reddit (sampled graph)
 
 ### Q-28 — Global schedule / phase fusion `[SIM]` blocking
 - Says: subgraphs are aggregated one after another. Combined nodes go to aggregation and also

@@ -3,3 +3,4 @@ torch>=2.2
 numpy>=1.26
 scipy>=1.11
 pytest>=8
+pymetis  # mega_pt.part_stats (METIS partitions, Q-27)

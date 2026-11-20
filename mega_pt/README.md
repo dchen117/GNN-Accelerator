@@ -138,6 +138,7 @@ Outputs go to `runs/<name>/`:
 | `train.py` | CLI: pretraining → calibration → QAT, multiple seeds, results JSON |
 | `ptq_frontier.py` | Debug: PTQ accuracy vs fixed per-layer bitwidth (no QAT), MSE clip per b |
 | `hw_stats.py` | Simulator design numbers from a saved model (`train.py --save-model`): integer-only reference forward (`int_forward`, the computation the hardware does, Q-16), fixed-point scale formats, accumulator ranges (Q-22), BSE utilization of the two tile-feeding schemes (Q-23). `python -m mega_pt.hw_stats runs/hw/<run>` |
+| `part_stats.py` | METIS partition statistics for Condense-Edge (Q-27): parts sized to the Aggregation Buffer, external (subgraph, node) pairs, batches touched per node. `python -m mega_pt.part_stats cora pubmed` |
 
 ## Metrics in `results.json`
 
