@@ -664,6 +664,10 @@ should say which kind it is: filling a gap, or departing from a stated detail.
       depends on the DRAM model: row-buffer locality, and access granularity vs the 64 B row.
       It is MEGA's mechanism, so the baseline keeps it, and the simulator reports its traffic.
     - Not measured: Reddit (sampled graph)
+  - **Simulator (2026-11-21, S-08):** one partition serves all layers, so the capacity comes from
+    the widest aggregated layer. NELL's 186-class output gives 176 destinations, hence 383
+    subgraphs (not 257); Sage-Cora (F2 = 256) gets 22. METIS runs with its default imbalance:
+    a tight one (ufactor 1) almost triples Cora's external rows (0.98 vs 0.35 per node).
 
 ### Q-28 — Global schedule / phase fusion `[SIM]` blocking
 - Says: subgraphs are aggregated one after another. Combined nodes go to aggregation and also
