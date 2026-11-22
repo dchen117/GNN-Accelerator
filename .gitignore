@@ -5,3 +5,4 @@ __pycache__/
 # downloaded datasets and experiment outputs
 data/
 runs/
+megasim/dram/replay

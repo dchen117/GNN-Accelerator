@@ -281,34 +281,140 @@ def weight_traffic(x: SparseRows, layer, ptr: np.ndarray, hw: HW) -> dict:
     per_node = np.bincount(row[miss], minlength=x.n)
     miss_lines = (seg_sum(per_node, ptr) * row_lines).astype(np.int64)
     tab_load = -(-tab_bytes // hw.line)
+    # DRAM byte address (inside the W̄ region) of every missed line, in fetch order, so the
+    # Ramulator replay sees the real scatter of row fetches (S-13)
+    mc = col[miss]
+    miss_addr = (mc[:, None] * row_lines + np.arange(row_lines)[None, :]).ravel() * hw.line
     return {"resident": False, "load_lines": tab_load, "miss_lines": miss_lines,
-            "misses": int(miss.sum()), "accesses": int(col.size), "slots": int(slots)}
+            "miss_addr": miss_addr, "miss_off": np.concatenate([[0], np.cumsum(miss_lines)]),
+            "misses": int(miss.sum()), "accesses": int(col.size),
+            "slots": int(slots)}
+
+
+W_LAYER_STRIDE = 1 << 24      # W̄⁽ˡ⁾ lives at l · 16 MB inside the W̄ DRAM region (S-13)
+
+
+def w_miss_addrs(w: dict, k: int, layer: int) -> dict:
+    """Explicit DRAM addresses of subgraph k's W̄ row misses (empty dict if W̄ is resident)."""
+    if w["resident"]:
+        return {}
+    a = w["miss_addr"][w["miss_off"][k]:w["miss_off"][k + 1]]
+    return {"w_miss": a + layer * W_LAYER_STRIDE}
+
+
+# --------------------------------------------------------------------------- SRAM accesses
+def sram_accesses(prog: Program, ptr: np.ndarray, xs: list, edges: list, wtraf: list,
+                  eid_bytes: int, eid_resident: bool, hw: HW) -> dict:
+    """Bytes read and written per on-chip buffer over the whole run (S-14), for the energy
+    model. They do not depend on timing. Per layer l (X̄ = xs[l], F2 = F_out):
+      Input      write: X̄ packages + bitmaps + 2 B degree index per node (from DRAM for l = 0,
+                 from the Encoder otherwise); read: the same once (bitmap scanned once,
+                 packages decoded once; bit-planes replay from the Bit FIFO, S-09)
+      Weight     write: W̄ + tables loaded, plus W̄ row misses; read: per non-zero and
+                 32-column block, the 32 · 4-bit weights of its row (16 B) via the crossbar
+      Comb.      write: every B̄ row (F2 · 4 bit) + external rows arriving from DRAM for
+                 aggregation; read: AUs read each (target subgraph, source) row once, and
+                 Condense reads each external (target, source) row once
+      Sparse     write/read: each external row once (written by Condense, read to flush)
+      Edge       write/read: CSC (1 B per edge + 2 B per source) once per aggregation; eIDs
+                 (4 B per external pair) loaded once if resident, read per combination sweep
+      Agg.       per edge: read + write F2 16-bit partial sums; Encoder reads every node's
+                 F2 sums once
+    """
+    n = prog.graph.n
+    acc = {b: {"read": 0.0, "write": 0.0} for b in
+           ("input_buf", "weight_buf", "comb_buf", "sparse_buf", "edge_buf", "agg_buf")}
+    L = len(prog.layers)
+    for l, lay in enumerate(prog.layers):
+        x = xs[l]
+        _, pb = package_lines(x, lay.bits, ptr, hw)
+        _, bb = bitmap_lines(x, ptr, hw)
+        xin = (pb.sum() + bb.sum()) / 8 + 2 * n
+        acc["input_buf"]["write"] += xin
+        acc["input_buf"]["read"] += xin
+        w = wtraf[l]
+        acc["weight_buf"]["write"] += (w["load_lines"] + w["miss_lines"].sum()) * hw.line
+        blocks = -(-lay.F_out // hw.cpes)
+        acc["weight_buf"]["read"] += x.val.size * blocks * hw.cpes * 4 / 8
+        rb = row_bits(lay.F_out) / 8
+        e = edges[l]
+        ext = float(e.ext_rows.sum())
+        acc["comb_buf"]["write"] += n * rb + ext * rb
+        acc["comb_buf"]["read"] += float(e.sources.sum()) * rb + ext * rb
+        acc["sparse_buf"]["write"] += ext * rb
+        acc["sparse_buf"]["read"] += ext * rb
+        csc = float(e.edges.sum()) * 1 + float(e.sources.sum()) * 2
+        acc["edge_buf"]["write"] += csc
+        acc["edge_buf"]["read"] += csc + e.pair_src.size * 4
+        if not eid_resident or l == 0:
+            acc["edge_buf"]["write"] += eid_bytes
+        acc["agg_buf"]["read"] += float(e.edges.sum()) * lay.F_out * 2 + n * lay.F_out * 2
+        acc["agg_buf"]["write"] += float(e.edges.sum()) * lay.F_out * 2
+    return {b: {k: float(v) for k, v in d.items()} for b, d in acc.items()}
 
 
 # --------------------------------------------------------------------------- 3-4. schedule
 class Dram:
     """FCFS bandwidth server with a fixed latency (S-12). Transfers are booked in the order the
-    schedule issues them; each occupies the server for bytes / bandwidth cycles."""
+    schedule issues them; each occupies the server for bytes / bandwidth cycles.
+
+    Every call is also logged (issue time, lines per stream, explicit addresses of scattered
+    streams), in call order. The call sequence does not depend on timing, so call i is the
+    same transfer in every run of the same program: megasim/dram/ramulator.py turns the log
+    into a Ramulator trace, and LatencyDram replays the measured latencies by call index."""
 
     def __init__(self, hw: HW):
         self.hw = hw
         self.free = 0.0
         self.busy = 0.0
         self.lines = defaultdict(float)          # stream → lines (read + write)
+        self.log: list = []                      # (t, {stream: lines}, {stream: addrs})
 
-    def xfer(self, t: float, streams: dict) -> tuple[float, float]:
+    def xfer(self, t: float, streams: dict, addrs: dict | None = None) -> tuple[float, float]:
         """Book one transfer made of several streams (name → lines) issued at time t.
+        `addrs` gives the byte addresses of streams that are not sequential (W̄ row misses).
         Returns (first data, last data); (t, t) if empty."""
+        i = len(self.log)
+        self.log.append((t, {k: float(v) for k, v in streams.items() if v}, addrs or {}))
         n = float(sum(streams.values()))
         for k, v in streams.items():
             self.lines[k] += float(v)
         if n == 0:
             return t, t
-        start = max(t, self.free)
         dur = n * self.hw.line / self.hw.dram_bytes_per_cycle
-        self.free = start + dur
         self.busy += dur
+        return self._time(i, t, dur)
+
+    def _time(self, i: int, t: float, dur: float) -> tuple[float, float]:
+        start = max(t, self.free)
+        self.free = start + dur
         return start + self.hw.dram_latency, start + self.hw.dram_latency + dur
+
+
+class LatencyDram(Dram):
+    """DRAM whose transfer i takes the latencies Ramulator measured for it (S-13):
+    first data at t + lat_first[i], last at t + lat_last[i]. Queueing behind other transfers
+    is inside the measured latency, so there is no server here; `free` is the latest
+    completion so far (the end of a sweep waits for it)."""
+
+    def __init__(self, hw: HW, lat_first: np.ndarray, lat_last: np.ndarray):
+        super().__init__(hw)
+        self.lat_first, self.lat_last = lat_first, lat_last
+
+    def _time(self, i: int, t: float, dur: float) -> tuple[float, float]:
+        first, last = t + self.lat_first[i], t + self.lat_last[i]
+        self.free = max(self.free, last)
+        return first, last
+
+
+class IdealDram(Dram):
+    """Data arrives the cycle it is requested (no bandwidth limit, no latency, no ordering).
+    Gives the compute-only time for the DRAM stall share (Fig.20(a)). Not the M2 server with
+    infinite bandwidth: that one still books transfers in call order, so a transfer issued
+    earlier in time but called after a posted write would wait for it."""
+
+    def _time(self, i: int, t: float, dur: float) -> tuple[float, float]:
+        return t, t
 
 
 @dataclass
@@ -335,6 +441,7 @@ class TimingReport:
     total_cycles: float
     dram_bytes: dict
     info: dict
+    dram: object = None      # the Dram used (its .log is the request trace, S-13)
 
     def summary(self) -> dict:
         busy = defaultdict(float)
@@ -353,15 +460,18 @@ class TimingReport:
                 **self.info}
 
 
-def simulate(prog: Program, ptr: np.ndarray, func: list[LayerResult], hw: HW = HW()) -> TimingReport:
+def simulate(prog: Program, ptr: np.ndarray, func: list[LayerResult], hw: HW = HW(),
+             dram: Dram | None = None) -> TimingReport:
     """Run the Q-28 schedule on a relabelled program whose subgraph k is node range
-    [ptr[k], ptr[k+1]). `func` is functional.run(prog) (gives each layer's X̄)."""
+    [ptr[k], ptr[k+1]). `func` is functional.run(prog) (gives each layer's X̄).
+    `dram` defaults to the M2 bandwidth server; megasim.dram.ramulator passes a LatencyDram.
+    The DRAM object (with its call log) is returned as report.dram."""
     g, L, K = prog.graph, len(prog.layers), ptr.size - 1
     n = g.n
     sub = np.repeat(np.arange(K), np.diff(ptr))
     sizes = np.diff(ptr)
     xs = [prog.x0] + [r.x_out for r in func[:-1]]
-    dram = Dram(hw)
+    dram = dram if dram is not None else Dram(hw)
     sweeps: list[SweepReport] = []
     info: dict = {"layers": []}
 
@@ -398,6 +508,7 @@ def simulate(prog: Program, ptr: np.ndarray, func: list[LayerResult], hw: HW = H
             li["x_spill_subgraphs"] = int((sub_bytes > hw.input_buf // 2).sum())
         info["layers"].append(li)
     info["eid_resident"] = bool(eid_resident)
+    info["sram"] = sram_accesses(prog, ptr, xs, edges, wtraf, eid_bytes, eid_resident, hw)
 
     t = 0.0
     # ================================================================ sweep 0: combine layer 0
@@ -421,7 +532,7 @@ def simulate(prog: Program, ptr: np.ndarray, func: list[LayerResult], hw: HW = H
               "w_miss": w["miss_lines"][k]}
         if not eid_resident:
             rd["eid"] = eid_lines_by_sub[k]
-        first, done = dram.xfer(comb_start_prev, rd)       # prefetch into the other half
+        first, done = dram.xfer(comb_start_prev, rd, w_miss_addrs(w, k, 0))  # prefetch, other half
         if pending_w:
             dram.xfer(pending_t, pending_w)
         cs = max(comb_end_prev, first)
@@ -479,7 +590,7 @@ def simulate(prog: Program, ptr: np.ndarray, func: list[LayerResult], hw: HW = H
                 crd = {"w_miss": w["miss_lines"][k]}
                 if not eid_resident:
                     crd["eid"] = eid_lines_by_sub[k]
-                _, cdone = dram.xfer(a_s, crd)
+                _, cdone = dram.xfer(a_s, crd, w_miss_addrs(w, k, l))
                 ec_s = max(a_e, ec_end_prev)
                 enc_end[k] = ec_s + sizes[k] * e
                 ec_e = max(ec_s + max(fused_t[k], cond_t[k]), cdone)
@@ -506,4 +617,4 @@ def simulate(prog: Program, ptr: np.ndarray, func: list[LayerResult], hw: HW = H
         t = s.end
 
     dram_bytes = {k: v * hw.line for k, v in dram.lines.items() if v}
-    return TimingReport(prog.name, hw, K, sweeps, t, dram_bytes, info)
+    return TimingReport(prog.name, hw, K, sweeps, t, dram_bytes, info, dram)

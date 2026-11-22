@@ -1,0 +1,92 @@
+{
+ "cacti": "CACTI 7.0 (HewlettPackard/cacti 1ffd8df)",
+ "technology_um": 0.028,
+ "cell": "itrs-lop",
+ "block_bytes": 64,
+ "buffers": {
+  "agg_buf": {
+   "read_nJ": 0.0426819,
+   "write_nJ": 0.0439532,
+   "leak_bank_mW": 5.92941,
+   "gate_leak_bank_mW": 0.0261655,
+   "area_mm2": 0.46676417124999997,
+   "cycle_ns": 0.669327,
+   "leak_mW": 47.644604,
+   "size": 131072,
+   "banks": 8,
+   "cell": "itrs-lop",
+   "periph": "itrs-lop",
+   "block": 64
+  },
+  "comb_buf": {
+   "read_nJ": 0.0323395,
+   "write_nJ": 0.0353002,
+   "leak_bank_mW": 4.9558,
+   "gate_leak_bank_mW": 0.0227196,
+   "area_mm2": 0.343075908968,
+   "cycle_ns": 0.409064,
+   "leak_mW": 39.8281568,
+   "size": 98304,
+   "banks": 8,
+   "cell": "itrs-lop",
+   "periph": "itrs-lop",
+   "block": 64
+  },
+  "input_buf": {
+   "read_nJ": 0.0238684,
+   "write_nJ": 0.0279663,
+   "leak_bank_mW": 5.55443,
+   "gate_leak_bank_mW": 0.0226372,
+   "area_mm2": 0.20062703961999998,
+   "cycle_ns": 0.446951,
+   "leak_mW": 22.3082688,
+   "size": 65536,
+   "banks": 4,
+   "cell": "itrs-lop",
+   "periph": "itrs-lop",
+   "block": 64
+  },
+  "edge_buf": {
+   "read_nJ": 0.0210545,
+   "write_nJ": 0.0223094,
+   "leak_bank_mW": 2.64456,
+   "gate_leak_bank_mW": 0.012473,
+   "area_mm2": 0.14232581832,
+   "cycle_ns": 0.353443,
+   "leak_mW": 10.628131999999999,
+   "size": 24576,
+   "banks": 4,
+   "cell": "itrs-lop",
+   "periph": "itrs-lop",
+   "block": 64
+  },
+  "sparse_buf": {
+   "read_nJ": 0.0216524,
+   "write_nJ": 0.0234759,
+   "leak_bank_mW": 3.22821,
+   "gate_leak_bank_mW": 0.0147025,
+   "area_mm2": 0.154113764402,
+   "cycle_ns": 0.372165,
+   "leak_mW": 12.971649999999999,
+   "size": 32768,
+   "banks": 4,
+   "cell": "itrs-lop",
+   "periph": "itrs-lop",
+   "block": 64
+  },
+  "weight_buf": {
+   "read_nJ": 0.0227466,
+   "write_nJ": 0.0257073,
+   "leak_bank_mW": 4.38561,
+   "gate_leak_bank_mW": 0.0188021,
+   "area_mm2": 0.177237170356,
+   "cycle_ns": 0.409064,
+   "leak_mW": 17.6176484,
+   "size": 49152,
+   "banks": 4,
+   "cell": "itrs-lop",
+   "periph": "itrs-lop",
+   "block": 64
+  }
+ }
+}

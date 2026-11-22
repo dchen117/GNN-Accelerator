@@ -4,9 +4,9 @@ The simulator of the MEGA baseline. Design and the reasons for each choice:
 `docs/simulator/00-design.md` (S-xx). The hardware it implements: Q-16 … Q-30, Q-35 in
 `docs/mega-kb/04-open-questions.md`.
 
-State (2026-11-21): **M1, the functional model, is done and bit-exact. M2, the timing model, is
-done** (cycles, unit utilization, DRAM traffic per stream). M3 (Ramulator 2.0, energy, the
-Fig.14/16/17/18 reports) is next.
+State (2026-11-22): **M1 (functional, bit-exact), M2 (timing) and M3 (Ramulator 2.1 HBM1,
+energy, Fig.14/16/17/18 quantities) are done.** The simulator is ready to serve as the
+baseline; our own design will go through the same DRAM model, energy numbers and reports.
 
 ## Run
 
@@ -15,13 +15,43 @@ Fig.14/16/17/18 reports) is next.
 python -m megasim.check runs/hw/* --json runs/hw/megasim_check.json
 ```
 
+One-time setup for the DRAM model (S-13): build Ramulator 2.1, then our replay driver.
+CACTI is only needed to regenerate `cacti_28nm.json`.
+
 ```bash
-# timing: METIS partition + relabel, functional run, Q-28 schedule, DRAM streams (M2)
-python -m megasim.sim runs/hw/* --json runs/hw/megasim_timing.json
+git clone https://github.com/CMU-SAFARI/ramulator2.git ~/ext/ramulator2
 ```
 
 ```bash
-python -m pytest tests/test_megasim.py tests/test_megasim_timing.py -q
+cd ~/ext/ramulator2 && mkdir -p build && cd build && cmake .. -DCMAKE_BUILD_TYPE=Release && make -j8
+```
+
+```bash
+RAMULATOR=~/ext/ramulator2 megasim/dram/build.sh
+```
+
+```bash
+# timing + energy: partition, functional run, Q-28 schedule, Ramulator HBM replay, energy
+python -m megasim.sim runs/hw/* --json runs/hw/megasim_m3.json
+```
+
+```bash
+# the same with the M2 bandwidth + latency DRAM server (no Ramulator needed)
+python -m megasim.sim runs/hw/* --dram m2 --json runs/hw/megasim_timing.json
+```
+
+```bash
+# Fig.14/16/17/18 quantities as a table (add --baseline other.json for ratios)
+python -m megasim.report runs/hw/megasim_m3.json
+```
+
+```bash
+# regenerate the SRAM numbers (needs CACTI 7: github.com/HewlettPackard/cacti, `make`)
+CACTI=~/ext/cacti/cacti python -m megasim.cacti
+```
+
+```bash
+python -m pytest tests/test_megasim.py tests/test_megasim_timing.py tests/test_megasim_m3.py -q
 ```
 
 A run directory needs `model_seed<s>.pt`, written by `python -m mega_pt.train ... --save-model`.
@@ -35,9 +65,15 @@ A run directory needs `model_seed<s>.pt`, written by `python -m mega_pt.train ..
 | `functional.py` | The datapath per layer: store/reload, bit-serial combination with the pass/tile split, Tile Accumulator, rescale, AUs, Encoder; range checks on every accumulator | S-04, Q-16, Q-22, Q-23, Q-25, Q-26 |
 | `check.py` | CLI: runs `functional` and `int_forward(fmt="fx16")` on the same model and compares every intermediate exactly | Q-30 |
 | `partition.py` | METIS partition (fewest subgraphs that fit the Aggregation Buffer half) and relabelling to contiguous subgraph ranges | S-08, Q-25, Q-27 |
-| `timing.py` | Per-unit cycle counts, DRAM traffic per stream, Condense region simulation, W̄ row cache, the sweep schedule as an event recurrence, FCFS DRAM server | S-02, S-09 … S-12, Q-23 … Q-29, Q-35 |
+| `timing.py` | Per-unit cycle counts, DRAM traffic per stream, Condense region simulation, W̄ row cache, SRAM access counts, the sweep schedule as an event recurrence, DRAM back-ends (FCFS server, `LatencyDram`, `IdealDram`) | S-02, S-09 … S-14, Q-23 … Q-29, Q-35 |
 | `tile_cycle.py` | Cycle-stepped model of the 4 Combination Tiles (crossbar, two C-PE halves, barrier per pass); checks the integers and the closed-form cycle count | S-03, Q-24 |
-| `sim.py` | CLI: export → partition → relabel → functional → timing, per run | — |
+| `dram/hbm_config.py`, `dram/hbm1_256GBps.yaml` | Ramulator 2.1 config: HBM1 8 × 128 bit at 2 Gb/s, FR-FCFS, open row | S-13, Q-29 |
+| `dram/replay.cpp`, `dram/build.sh` | C++ driver: replays the transfer log through Ramulator (per-channel DMA FIFOs, our address mapping), returns each transfer's first/last completion | S-13 |
+| `dram/ramulator.py` | Transfer log → line addresses (one region per stream), runs the driver, fixed-point iteration with `timing.LatencyDram` | S-13 |
+| `cacti.py`, `cacti_28nm.json` | CACTI 7.0 runs per buffer at 28 nm (organization calibrated to Tab.IV area) and their cached results | S-14 |
+| `energy.py` | DRAM (7 pJ/bit), SRAM (CACTI per access), PU (Tab.IV power × busy cycles), leakage | S-14 |
+| `report.py` | Fig.14/16/17/18-style table from a `sim.py --json` file, optionally as ratios to another design | — |
+| `sim.py` | CLI: export → partition → relabel → functional → timing (Ramulator or M2 DRAM) → energy, per run | — |
 | `synthetic.py` | Random but consistent programs, for tests and debugging without trained runs | — |
 
 ## Debugging
@@ -55,6 +91,15 @@ A run directory needs `model_seed<s>.pt`, written by `python -m mega_pt.train ..
   (cycles per node, external rows, W̄ residency/miss rate, Input Buffer fit). A sweep that is
   much longer than its busiest unit and its `dram_busy` points at a dependency stall.
 - `tile_cycle.simulate` is slow (Python per cycle); use it on a handful of nodes only.
+- DRAM: `report.dram.log` is the list of transfers (issue cycle, lines per stream, explicit
+  addresses). `ramulator.trace_from_log` + `ramulator.replay` replay any log by hand; the
+  driver's `.stats` (Ramulator's YAML) lands in `rep.info["ramulator"]` (row hits/misses/
+  conflicts, average read latency, refused requests = full controller queues). If the fixed
+  point does not converge (`converged: false`), `cycles_history` shows whether it oscillates.
+- `replay` raises "batch did not complete" if a request never returned. That means a driver or
+  config mismatch: `kChannels` / `kChannelShift` in `replay.cpp` must match `hbm_config.py`.
+- Energy: `energy.energy(rep)` gives per-buffer (`sram_uJ`) and per-unit (`pu_uJ`) splits;
+  `rep.info["sram"]` holds the bytes behind them.
 - Without trained runs: `megasim.synthetic.random_program()` gives a program both models run on.
 
 ## Results: M1 functional check (2026-11-20)
@@ -127,3 +172,39 @@ What this shows:
   subgraph 16.7 KB of 32 KB). So the Adaptive-Package compression of hidden layers saves
   on-chip space, not DRAM traffic, in this schedule; DRAM sees X⁽⁰⁾, W̄, and 4-bit B̄ rows.
 - NELL has 383 subgraphs, not 257: its 186-class output layer sets the capacity to 176 (S-08).
+
+## Results: M3 Ramulator + energy (2026-11-22)
+
+`python -m megasim.sim runs/hw/* --json runs/hw/megasim_m3.json`, then `python -m megasim.report`.
+HBM1 256 GB/s in Ramulator 2.1 (S-13), energy per S-14. *DRAM stall* = share of the time lost to
+DRAM (Fig.20(a)): 1 − time with data arriving instantly / time.
+
+| Run | K | Time µs | DRAM MB | Energy µJ | DRAM % | SRAM % | PU % | Leakage % | Row hit | DRAM stall |
+|---|---|---|---|---|---|---|---|---|---|---|
+| gcn_cora | 11 | 58.8 | 1.70 | 119.2 | 83.7 | 7.6 | 1.3 | 7.4 | 0.92 | 0.8 % |
+| gcn_citeseer | 14 | 91.0 | 5.03 | 323.3 | 91.3 | 3.8 | 0.7 | 4.2 | 0.96 | 0.3 % |
+| gcn_pubmed | 80 | 441.9 | 7.20 | 573.5 | 73.8 | 12.5 | 2.1 | 11.6 | 0.87 | 0.2 % |
+| gcn_nell | 383 | 16,687 | 556.3 | 36,331 | 89.9 | 2.1 | 1.0 | 6.9 | 0.97 | 0.0 % |
+| gin_cora | 11 | 60.0 | 1.70 | 119.5 | 83.5 | 7.6 | 1.3 | 7.6 | 0.92 | 0.5 % |
+| gin_citeseer | 14 | 82.7 | 5.03 | 321.5 | 91.8 | 3.7 | 0.6 | 3.9 | 0.96 | 1.2 % |
+| gin_amazon-ratings | 99 | 1,570 | 6.98 | 895.9 | 45.8 | 23.6 | 4.2 | 26.5 | 0.86 | 0.0 % |
+| sage_cora | 22 | 97.5 | 4.21 | 281.8 | 87.7 | 6.2 | 0.9 | 5.2 | 0.94 | 0.5 % |
+
+Findings:
+- **Ramulator changes the time by at most 0.7 % compared with the M2 server** (−0.7 … +0.1 %).
+  - Average read latency is 50–64 cycles, below M2's assumed 100.
+  - The fixed point converges in 1–5 iterations.
+  - DRAM stalls are 0–1.2 % of the time. This agrees with MEGA's remark that most DRAM cycles
+    are overlapped (§VI-D-2) and with Fig.20(a), where MEGA has the lowest stall share.
+- **DRAM dominates energy** (74–92 %), except on amazon-ratings (46 %): there W̄ is resident,
+  X⁽⁰⁾ is dense and small, and the run is long, so leakage and SRAM weigh more. Fig.1 cites
+  90.2 % DRAM energy for a prior accelerator. MEGA's own split is only given relative to
+  HyGCN (Fig.18).
+- **On-chip power** (SRAM + PU + leakage over the run) is 220–356 mW, compared with Tab.IV's
+  195 mW.
+  - CACTI's leakage alone is 151 mW: that is the itrs-lop cell choice, which matches Tab.IV
+    buffer area and power best (S-14).
+  - SRAM dynamic energy is mostly Aggregation Buffer read-modify-writes (16-bit partial sums
+    per edge) and Weight Buffer crossbar reads.
+- High row-hit rates (0.86–0.97): almost all streams are sequential by construction (S-10).
+  W̄ row misses are the scattered part.

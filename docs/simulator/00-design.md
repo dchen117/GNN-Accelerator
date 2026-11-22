@@ -3,7 +3,8 @@
 Status: **M1 (functional model) done and bit-exact on all 8 saved models**, 2026-11-20.
 **M2 (timing model) done**, 2026-11-21: partition + relabel, per-unit cycle counts, the Q-28
 sweep schedule, Condense-Edge, DRAM streams with a bandwidth model, and the cycle-stepped tile
-check (results: `megasim/README.md`). M3 (Ramulator, energy, reports) next. The hardware decisions it implements
+check (results: `megasim/README.md`). **M3 done**, 2026-11-22: Ramulator 2.1 HBM1 replay,
+energy (DRAM / SRAM / PU / leakage) and the Fig.14/16/17/18 quantities. The hardware decisions it implements
 are Q-16 … Q-30 and Q-35 in `docs/mega-kb/04-open-questions.md`; this file records only the
 decisions about *how the simulator is built* (S-xx). Each lists why and what it costs.
 
@@ -155,8 +156,89 @@ its last stage and all its writes are done (the next sweep reads them), plus the
 ### S-12 — DRAM in M2: one FCFS bandwidth server with a fixed latency
 - 256 B/cycle (256 GB/s at 1 GHz), 100 cycles latency per transfer (ours, typical HBM read
   latency); transfers are booked in issue order; writes take bandwidth but block nobody.
-- M3 replays the same streams through Ramulator 2.0. Traffic (bytes) does not depend on the
-  timing model, only stalls do (tested).
+- M3 replays the same streams through Ramulator (S-13). Traffic (bytes) does not depend on the
+  timing model, only stalls do (tested). The M2 server stays available (`--dram m2`).
+
+### S-13 — DRAM in M3: Ramulator 2.1 HBM1, coupled by fixed-point iteration
+- **Simulator:** Ramulator 2.1 (CMU-SAFARI/ramulator2, commit 7bead6cb, 2026-11-04; it is the
+  current release of "Ramulator 2.0" and still models HBM1). Built outside the repo;
+  `megasim/dram/build.sh` builds our C++ driver `megasim/dram/replay.cpp` against it and
+  exports the config `megasim/dram/hbm1_256GBps.yaml` from `megasim/dram/hbm_config.py`.
+- **Device (Q-29):** HBM1, 1 stack, 8 channels × 128 bit, preset `HBM1_4Gb` / `HBM1_2Gbps`
+  (2 Gb/s per pin → 32 GB/s per channel → 256 GB/s). The command clock is 1 GHz, equal to
+  the accelerator clock, so one memory tick = one cycle. Controller: Ramulator's HBM12 with
+  FR-FCFS, open-row policy and all-bank refresh, 32-entry read and write queues per channel
+  (Ramulator defaults).
+  - Why 2 Gb/s: HBM1 at 1 Gb/s gives only 128 GB/s per stack. The paper states both "HBM1.0"
+    and "256 GB/s"; HBM1's 2 Gb/s grade gives both with one stack, which is what Q-29 decided.
+    (HyGCN, whose setup MEGA copies, does not give its stack count either.)
+- **Address mapping (ours):** from MSB to LSB, row | bank | column[5:1] | bank group | channel
+  | column[0] | byte. 64 B lines go round the 8 channels, then a channel's 4 bank groups,
+  then along the open 2 KB row; both 32 B halves of a line (HBM1 BL2 = 32 B) stay in one
+  row. Implemented in `replay.cpp` `remap()`; Ramulator decodes the result with RoBaRaCoCh.
+  - Why: a sequential stream reaches 92.6 % of 256 GB/s (1 MB in 4421 cycles; the ideal is
+    4096). Ramulator's RoBaRaCoCh alone keeps a stream in one bank group, where tCCD_L = 2
+    halves the column rate (69 %). MOP4CLXOR reaches 84 %, but its XOR splits the two halves
+    of a line over two banks, so scattered 64 B W̄ fetches open two rows each.
+  - Random 64 B lines reach 39 % of peak (1 MB in 10.5 k cycles), the usual HBM behaviour.
+- **Addresses:** each stream has its own 256 MB region and is walked sequentially (packages,
+  bitmaps, CSC, Sparse areas, B̄ rows are contiguous per subgraph, S-10). W̄ row misses use
+  their real row addresses (`w_miss_addrs`). A stream written in one sweep and read in the
+  next (B̄, Sparse) shares a region with its reader.
+- **Requester (ours):** the DMA keeps one FIFO per channel. A transfer's lines enter at its
+  issue cycle and are offered to the controller at up to 2 × 32 B per channel per cycle (one
+  line, i.e. the channel's peak). A refused request (queue full) is retried the next cycle.
+  Reads complete when Ramulator returns the data. Writes complete when their WR issues
+  (Ramulator's convention).
+- **Coupling:** the timing model makes the same sequence of DRAM transfers whatever the
+  timing (the issue times change, the transfers do not). So:
+  1. run the timing model with the M2 server and log every transfer;
+  2. replay the log in Ramulator and measure each transfer's latency to first and last data;
+  3. rerun the timing model with those latencies (`timing.LatencyDram`), which gives new
+     issue times;
+  4. repeat steps 2–3 until the total time changes by less than 0.1 %.
+
+  This converges in 3–6 iterations here, because DRAM is lightly loaded and the system is
+  compute-bound.
+  - Why not run Ramulator inside the event loop: the event recurrence computes subgraph k's
+    times before issuing k+1's transfers, but some of k's posted writes are issued later than
+    k+1's reads. A lock-step co-simulation would need the event model rewritten as a cycle
+    loop; the fixed point gives the same answer at the converged schedule.
+  - Cost: queueing interactions are those of the previous iteration's schedule; at
+    convergence the two agree to within 0.1 % in time.
+- **DRAM stall share** (Fig.20(a)) = 1 − (time with `timing.IdealDram`: data arrives the cycle
+  it is requested) / time. It is not "the M2 server with infinite bandwidth": that server books
+  transfers in call order, so a read called after a later-issued posted write waits for it.
+  This is a small artifact of the M2 server, about 0.04 % on NELL; Ramulator queues by
+  arrival time and does not have it.
+
+### S-14 — Energy: DRAM pJ/bit, CACTI 7.0 SRAM, Tab.IV PU power
+Fig.18's four categories:
+- **DRAM:** 7 pJ/bit for every byte moved. This is HyGCN's HBM1.0 figure (HyGCN cites
+  [32, 41] for it), and MEGA says its DRAM energy "follows the methodology in [56]" =
+  HyGCN. Fig.18's DRAM column equals Fig.16's access ratio exactly, which also means a fixed
+  energy per bit.
+  - Alternative: Ramulator 2.1's Ayna HBM power model. It does not support HBM1, and it
+    would not be MEGA's methodology.
+- **SRAM:** CACTI 7.0 (HewlettPackard/cacti, 1ffd8df) at 28 nm, as MEGA states.
+  - Each Tab.IV buffer is modelled as a scratch RAM with one R/W port and a 64 B access.
+  - Configuration chosen by matching Tab.IV's measured area. We swept cell type
+    (itrs-hp / lop / lstp) and bank count (1–32). itrs-lop with 8 banks (Aggregation,
+    Combination) and 4 banks (the rest) matches areas within 0–24 % (1.48 vs 1.67 mm²), and
+    its leakage within 2–23 % of Tab.IV's buffer powers (151 vs 141 mW).
+  - Results cached in `megasim/cacti_28nm.json`; `python -m megasim.cacti` regenerates them.
+  - Energy = bytes read / 64 × read energy + bytes written / 64 × write energy.
+    `timing.sram_accesses` counts the bytes per buffer; its docstring lists what counts as
+    an access.
+- **PU:** Tab.IV power of each unit × the cycles that unit is busy (BSEs, crossbar and
+  Decoder with combination; AUs with aggregation; Encoder; Condense). "Others" is charged
+  for the whole run.
+  - Ours: Tab.IV's numbers are read as a unit's power while working, and idle units are
+    treated as clock-gated. The paper does not say how power becomes energy.
+- **Leakage:** CACTI leakage of all buffers × run time. PU leakage stays inside the PU
+  numbers.
+- **Check:** on-chip power from the model, (SRAM + PU + leakage) / time, can be compared
+  with Tab.IV's 195 mW (README, M3 results).
 
 ## 3. Milestones
 
@@ -164,4 +246,4 @@ its last stage and all its writes are done (the next sweep reads them), plus the
 |---|---|---|
 | M1 | program export, Adaptive-Package encode/decode, functional datapath, bit-exact check on all `runs/hw` models | **done** 2026-11-20 |
 | M2 | partition + relabel, per-unit timing, Q-28 event schedule, Condense-Edge (B2 + batch-min skip), DRAM streams with a bandwidth model, one-tile cycle-stepped check (S-03) | **done** 2026-11-21 |
-| M3 | Ramulator 2.0 HBM, energy (CACTI-style SRAM per access from Tab.IV power, DRAM pJ/bit, Q-29), reports matching Fig.14/16/17/18 | — |
+| M3 | Ramulator 2.1 HBM1 replay (S-13), energy with CACTI 7.0 SRAM, 7 pJ/bit DRAM and Tab.IV PU power (S-14), reports matching Fig.14/16/17/18 (`megasim/report.py`) | **done** 2026-11-22 |

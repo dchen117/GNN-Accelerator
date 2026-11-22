@@ -704,6 +704,12 @@ should say which kind it is: filling a gap, or departing from a stated detail.
     outputs) gets its own contiguous address region.
   - Energy: a fixed pJ/bit per access, taken from one published HBM figure (to be chosen and
     cited).
+  - **Implemented 2026-11-22 (M3, `docs/simulator/00-design.md` S-13/S-14):**
+    - Ramulator 2.1 with HBM1 at 2 Gb/s per pin. 1 Gb/s would give only 128 GB/s per stack.
+    - Address mapping (ours): 64 B lines interleaved over the channels, then over the bank
+      groups. A sequential stream reaches 92.6 % of peak.
+    - DRAM energy = **7 pJ/bit**, HyGCN's HBM1.0 figure. MEGA's [56] is HyGCN, so this is the
+      figure MEGA's stated methodology gives.
 
 ### Q-30 — Simulator availability `[SIM]` affects-fidelity
 - Says: "We implement cycle-accurate simulators ... validated with the HDL design at the cycle
