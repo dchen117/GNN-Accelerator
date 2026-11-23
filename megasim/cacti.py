@@ -42,7 +42,7 @@ BLOCK = 64          # bytes per access
 _SUBST = {
     "-size (bytes)": "-size (bytes) {size}",
     "-block size (bytes)": "-block size (bytes) {block}",
-    "-associativity": "-associativity 1",
+    "-associativity": "-associativity {assoc}",
     "-UCA bank count": "-UCA bank count {banks}",
     "-technology (u)": "-technology (u) 0.028",
     "-Data array cell type": '-Data array cell type - "{cell}"',
@@ -50,7 +50,7 @@ _SUBST = {
     "-Tag array cell type": '-Tag array cell type - "{cell}"',
     "-Tag array peripheral type": '-Tag array peripheral type - "{periph}"',
     "-output/input bus width": "-output/input bus width {bus}",
-    "-cache type": '-cache type "ram"',
+    "-cache type": '-cache type "{ctype}"',
     "-Add ECC": '-Add ECC - "false"',
     "-Print input parameters": '-Print input parameters - "false"',
 }
@@ -76,8 +76,10 @@ _PAT = {
 
 
 def run(size: int, banks: int, cell: str = "itrs-lop", periph: str = "itrs-lop",
-        block: int = BLOCK) -> dict:
-    cfg = _config(size=size, block=block, banks=banks, cell=cell, periph=periph, bus=block * 8)
+        block: int = BLOCK, assoc: int = 1, ctype: str = "ram") -> dict:
+    """ctype "ram" (scratchpad, MEGA's buffers) or "cache" (tags + data, assoc ways; SGCN)."""
+    cfg = _config(size=size, block=block, banks=banks, cell=cell, periph=periph, bus=block * 8,
+                  assoc=assoc, ctype=ctype)
     with tempfile.NamedTemporaryFile("w", suffix=".cfg", delete=False) as f:
         f.write(cfg)
         path = f.name
@@ -93,7 +95,7 @@ def run(size: int, banks: int, cell: str = "itrs-lop", periph: str = "itrs-lop",
             raise RuntimeError(f"CACTI output has no {k}:\n{out[-2000:]}")
         r[k] = float(m.group(1)) * float(m.group(2)) if k == "area_mm2" else float(m.group(1))
     r["leak_mW"] = banks * (r["leak_bank_mW"] + r["gate_leak_bank_mW"])
-    r.update(size=size, banks=banks, cell=cell, periph=periph, block=block)
+    r.update(size=size, banks=banks, cell=cell, periph=periph, block=block, assoc=assoc, ctype=ctype)
     return r
 
 

@@ -43,8 +43,12 @@ REGION_BITS = 28                     # 256 MB per stream region; 16 regions = th
 # stream → region. A stream that is written in one sweep and read in the next shares the
 # region with its reader (same addresses, same row behaviour).
 REGION = {"x0_pkg": 0, "x0_bitmap": 1, "meta": 2, "weights": 3, "w_miss": 3, "eid": 4,
-          "csc": 5, "b_int_w": 6, "b_int_r": 6, "sparse_w": 7, "sparse_r": 7, "logits": 8}
-WRITES = {"b_int_w", "sparse_w", "logits"}
+          "csc": 5, "b_int_w": 6, "b_int_r": 6, "sparse_w": 7, "sparse_r": 7, "logits": 8,
+          # SGCN (sgcnsim/timing.py): CSR topology, CSR X⁽⁰⁾, W⁽⁰⁾ rows (cache misses), dense
+          # T = X⁽⁰⁾W⁽⁰⁾, BEICSR features, systolic-array weights
+          "sg_topo": 9, "sg_x0": 10, "sg_w": 11, "sg_t_w": 12, "sg_t_r": 12, "sg_x_w": 13,
+          "sg_x_r": 13, "sg_wl": 14}
+WRITES = {"b_int_w", "sparse_w", "logits", "sg_t_w", "sg_x_w"}
 # sequential streams start at an offset inside the region so they do not overlap explicit
 # addresses (W̄ misses use l · 16 MB + row offset, layers < 8)
 SEQ_OFFSET = {"weights": 1 << 27}
@@ -155,11 +159,13 @@ def latencies(trace_t: np.ndarray, first: np.ndarray, last: np.ndarray):
     return lf.astype(np.float64), ll.astype(np.float64)
 
 
-def simulate_ramulator(prog, ptr, func, hw: timing.HW = timing.HW(), iters: int = 6,
-                       tol: float = 1e-3, workdir: str | None = None,
-                       verbose: bool = False) -> timing.TimingReport:
-    """Timing model with Ramulator's HBM timing (fixed point, see module doc)."""
-    rep = timing.simulate(prog, ptr, func, hw)
+def fixed_point(run, hw, iters: int = 6, tol: float = 1e-3, workdir: str | None = None,
+                verbose: bool = False):
+    """Ramulator timing for any timing model (see module doc). `run(dram)` simulates with the
+    given DRAM back-end (None = the M2 server) and returns a report with `.dram` (whose `.log`
+    is the transfer log), `.total_cycles` and an `.info` dict. The call sequence of `run` must
+    not depend on timing. Used for MEGA (simulate_ramulator) and SGCN (sgcnsim)."""
+    rep = run(None)
     history = [rep.total_cycles]
     stats = {}
     for it in range(iters):
@@ -167,7 +173,7 @@ def simulate_ramulator(prog, ptr, func, hw: timing.HW = timing.HW(), iters: int 
         first, last, stats = replay(tr, workdir)
         t_log = np.array([np.ceil(e[0]) for e in rep.dram.log], dtype=np.int64)
         lf, ll = latencies(t_log, first, last)
-        rep = timing.simulate(prog, ptr, func, hw, dram=timing.LatencyDram(hw, lf, ll))
+        rep = run(timing.LatencyDram(hw, lf, ll))
         history.append(rep.total_cycles)
         if verbose:
             print(f"  ramulator iteration {it + 1}: {rep.total_cycles:.0f} cycles")
@@ -183,3 +189,11 @@ def simulate_ramulator(prog, ptr, func, hw: timing.HW = timing.HW(), iters: int 
         "refused_tx": int(stats["driver"].get("refused_tx", 0)),
         "replay_cycles": int(stats["driver"].get("cycles", 0))}
     return rep
+
+
+def simulate_ramulator(prog, ptr, func, hw: timing.HW = timing.HW(), iters: int = 6,
+                       tol: float = 1e-3, workdir: str | None = None,
+                       verbose: bool = False) -> timing.TimingReport:
+    """MEGA's timing model with Ramulator's HBM timing (fixed point, see module doc)."""
+    return fixed_point(lambda d: timing.simulate(prog, ptr, func, hw, dram=d), hw, iters, tol,
+                       workdir, verbose)
