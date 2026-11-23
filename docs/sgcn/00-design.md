@@ -303,3 +303,42 @@ accepted MEGA micro-architecture.**
   - Our earlier note bounded the paper's MEGA at "≈ 67 MB" from HyGCN's 16 GB input. That
     inverted a lower bound and is corrected in S-15.
 - Reddit is still missing (no GCN-Reddit run).
+
+### GCN on Reddit: feasibility (checked 2026-11-23)
+
+Reddit is the paper's largest MEGA-vs-SGCN gap (15.4× speedup), so it matters, but it does not
+fit this container (15 GB RAM, 4 CPUs).
+
+Measured:
+- 232,965 nodes, 114.6 M edges, degree up to 21,658 (mean 493).
+- Loading the graph and building GCN's normalized adjacency already peaks at **12.3 GB RSS**.
+
+What each step needs:
+1. **Train GCN-Reddit (FP32 + MEGA QAT).**
+   - Full-graph GCN (Tab.III: no sampling). Inductive training on the train subgraph (~50 M
+     edges) helps, but evaluation, and the hardware, need the full graph.
+   - Estimate: 1–3 h per seed and well over 15 GB.
+   - Fidelity check to run: hub nodes (21 k in-edges) against the 16-bit Aggregation Unit
+     partial sums (Q-25). megasim reports any overflow, but a model that saturates would be
+     a finding in itself.
+2. **megasim.** The code works unchanged in principle.
+   - Four int64 edge arrays are 3.7 GB, and `np.unique` over (subgraph, source) pairs roughly
+     doubles that at its peak.
+   - The Condense traffic loop is pure Python over the external pairs (tens of millions):
+     minutes.
+   - Ramulator replays roughly 100 M lines per fixed-point iteration.
+   - Feasible on a ≥ 64 GB machine. Here it would need int32 indices and chunking.
+3. **sgcnsim needs a streaming mode.**
+   - SGCN reads about 8 lines per edge per layer, so the plan materializes ~1.9 G cached line
+     addresses: 15 GB as int64 before any miss list.
+   - Needed:
+     - generate and simulate the cache strip-chunk by strip-chunk, keeping only per-item
+       miss counts;
+     - calibrate each phase's bandwidth (`BackfillDram`) from a sampled prefix replay
+       instead of the full trace;
+     - skip the full-trace Ramulator check, or run it on a sample.
+   - About a day of work. The results should stay identical on the small datasets, which
+     gives a regression check.
+
+Recommendation: run Reddit on a larger cloud machine (≥ 64 GB RAM, ≥ 16 cores). Do the
+sgcnsim streaming mode first; it can be developed and verified here on the small datasets.
