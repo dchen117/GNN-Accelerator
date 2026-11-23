@@ -214,13 +214,13 @@ SGCN breakdown:
 
 | | Cora | CiteSeer | PubMed | NELL |
 |---|---|---|---|---|
-| phase A / B / C (k cycles) | 99 / 39 / 153 | ≈ 213 / 45 / 160 | ≈ 2000 / 500 / 500 | 1149 / 791 / 97,845 |
-| HBM efficiency per phase (Ramulator) | 0.72 / 0.58 / 0.53 | | | |
+| phase A / B / C (k cycles) | 99 / 39 / 153 | 212 / 45 / 161 | 1986 / 513 / 500 | 1149 / 791 / 97,845 |
+| HBM efficiency per phase (Ramulator) | 0.72 / 0.58 / 0.53 | 0.80 / 0.57 / 0.53 | 0.68 / 0.46 / 0.42 | 0.55 / 0.64 / 0.62 |
 | cache hit rate | 0.76 | 0.83 | 0.84 | 0.47 |
 | DRAM stall share | 4.0 % | 4.6 % | 10.6 % | 0.4 % |
 
-Across all datasets, the per-phase HBM efficiency is 0.42–0.74, and Ramulator's replay ends
-when the schedule does (1.00).
+On every dataset, Ramulator's replay of the schedule's own trace ends when the schedule does
+(1.00).
 
 Findings:
 
@@ -244,6 +244,6 @@ Findings:
     those bitmaps alone.
   - This belongs with the open MEGA DRAM-accounting question (hidden-layer fusion, Fig.19),
     which is on hold.
-- **Energy follows DRAM** (DRAM is 58–89 % of SGCN's energy). NELL also pays 29 % leakage
+- **Energy follows DRAM** (DRAM is 58–84 % of SGCN's energy). NELL also pays 29 % leakage
   over its 100 ms run.
 - Reddit is missing (no GCN-Reddit run). In the paper it is the largest gap (15.4× speedup).
