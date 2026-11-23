@@ -114,12 +114,13 @@ def _expand(offsets: np.ndarray, counts: np.ndarray, line: int) -> np.ndarray:
 
 def w0_tile(F0: int, F1: int, hw: HW) -> int:
     """Column-tile width of W⁽⁰⁾ for phase A (G-04): the widest power-of-two divisor of F1
-    (≥ 16, one line) whose F0 × w tile fits half the cache; F1 (no tiling) if none does, since
-    a tile that cannot stay resident only multiplies the X⁽⁰⁾ re-reads."""
+    (≥ 16, one line) whose F0 × w tile fits ¾ of the cache (W⁽⁰⁾ is the only cached data in
+    phase A; ¼ is margin for set conflicts); F1 (no tiling) if none does, since a tile that
+    cannot stay resident only multiplies the X⁽⁰⁾ re-reads."""
     best = None
     w = 16
     while w <= F1:
-        if F1 % w == 0 and F0 * w * hw.word <= hw.cache_bytes // 2:
+        if F1 % w == 0 and F0 * w * hw.word <= hw.cache_bytes * 3 // 4:
             best = w
         w *= 2
     return best or F1
@@ -279,6 +280,58 @@ def simulate_cache(phases: list, hw: HW) -> None:
 
 
 # --------------------------------------------------------------------------- schedule
+class BackfillDram(mt.Dram):
+    """Bandwidth server booked in TIME order (G-06): a transfer issued at t takes the earliest
+    free bandwidth at or after t, filling gaps between transfers booked earlier, possibly
+    split over several gaps. Unlike megasim's FCFS server (which serves in call order), a read
+    issued early but called after a late posted write is not blocked by it.
+
+    `bw[k]` is phase k's sustained bandwidth in bytes/cycle, measured with Ramulator by
+    replaying that phase's own accesses at saturation (sim.calibrate); `latency` is
+    Ramulator's unloaded read latency. Data of a transfer: first = start of its first slot +
+    latency, last = end of its last slot + latency."""
+
+    def __init__(self, hw, bw: list, latency: float):
+        super().__init__(hw)
+        self.bw, self.latency, self.phase = bw, latency, 0
+        self.starts: list = []         # sorted, disjoint busy intervals
+        self.ends: list = []
+
+    def set_phase(self, k: int) -> None:
+        self.phase = k
+
+    def _time(self, i: int, t: float, dur: float) -> tuple[float, float]:
+        import bisect
+        need = dur * self.hw.dram_bytes_per_cycle / self.bw[self.phase]
+        S, E = self.starts, self.ends
+        j = bisect.bisect_right(E, t)                 # first interval ending after t
+        cur, first = t, None
+        while need > 1e-12:
+            if j < len(S) and S[j] <= cur:            # inside a busy interval: skip it
+                cur = max(cur, E[j])
+                j += 1
+                continue
+            gap_end = S[j] if j < len(S) else float("inf")
+            take = min(need, gap_end - cur)
+            if first is None:
+                first = cur
+            # book [cur, cur + take): merge with neighbours
+            a, b = cur, cur + take
+            if j > 0 and E[j - 1] >= a:
+                j -= 1
+                E[j] = b
+            else:
+                S.insert(j, a)
+                E.insert(j, b)
+            if j + 1 < len(S) and S[j + 1] <= E[j]:
+                E[j] = E[j + 1]
+                del S[j + 1], E[j + 1]
+            need -= take
+            cur = b
+        self.free = max(self.free, cur + self.latency)
+        return first + self.latency, cur + self.latency
+
+
 class UncontendedDram(mt.Dram):
     """Every transfer gets the fixed latency + its own bytes at full bandwidth, with no queueing
     behind other transfers (G-06). Only the starting point of the Ramulator fixed point and a
@@ -316,7 +369,10 @@ def schedule(plan: Plan, hw: HW = HW(), dram: mt.Dram | None = None) -> Report:
     E = hw.agg_engines
     t = 0.0
     out = []
-    for p in plan.phases:
+    for k, p in enumerate(plan.phases):
+        if hasattr(dram, "set_phase"):
+            dram.set_phase(k)
+        log0 = len(dram.log)
         start = t
         w_ready = t
         if p.pre_read:
@@ -356,7 +412,7 @@ def schedule(plan: Plan, hw: HW = HW(), dram: mt.Dram | None = None) -> Report:
         out.append({"name": p.name, "start": start, "end": end, "cycles": end - start,
                     "busy": {"agg_engines": busy_eng / E, "comb": busy_comb},
                     "accesses": int(p.acc_addr.size), "hits": int(p.hit.sum()),
-                    "items": p.items})
+                    "items": p.items, "log": (log0, len(dram.log))})
         t = end
     return Report(hw=hw, total_cycles=t, phases=out, dram=dram,
                   info={"w0_tile": plan.w0_tile,

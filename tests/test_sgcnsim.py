@@ -40,8 +40,8 @@ def test_beicsr_layout_and_lines():
 
 
 def test_w0_tile_choice():
-    # Cora / CiteSeer / PubMed / NELL input widths against the 196 KB half cache
-    assert [T.w0_tile(f, 128, HW) for f in (1433, 3703, 500, 61278)] == [32, 128, 64, 128]
+    # Cora / CiteSeer / PubMed / NELL input widths against ¾ of the 392 KB cache (294 KB)
+    assert [T.w0_tile(f, 128, HW) for f in (1433, 3703, 500, 61278)] == [32, 16, 128, 128]
 
 
 def test_compiled_cache_matches_python():
@@ -81,12 +81,25 @@ def test_schedule_traffic_and_ideal_bound():
     assert set(e["uJ"]) == {"dram", "sram", "pu", "leakage"} and all(v > 0 for v in e["uJ"].values())
 
 
+def test_backfill_server_books_in_time_order():
+    d = T.BackfillDram(HW, [256.0], 0)
+    assert d.xfer(100, {"x": 4}) == (100, 101)        # 4 lines = 256 B = 1 cycle
+    assert d.xfer(10, {"x": 8}) == (10, 12)           # called later, issued earlier: not blocked
+    assert d.xfer(9, {"x": 12}) == (9, 14)            # 9–10, then the gap after 12
+    assert d.xfer(99, {"x": 8}) == (99, 102)          # splits around the booking at 100
+    assert d.starts == [9, 99] and d.ends == [14, 102]
+    half = T.BackfillDram(HW, [128.0], 5)             # half bandwidth, latency 5
+    assert half.xfer(0, {"x": 4}) == (5, 7)
+
+
 @pytest.mark.skipif(not (R.DRIVER.exists() and R.CONFIG.exists()), reason="run megasim/dram/build.sh")
-def test_ramulator_fixed_point():
+def test_ramulator_calibrated_schedule():
+    from sgcnsim.sim import simulate_ramulator
     w = synthetic()
     plan = T.build_plan(w, HW)
-    rep = R.fixed_point(lambda d: T.schedule(plan, HW, d), HW)
-    info = rep.info["ramulator"]
-    assert info["converged"]
-    assert info["num_read_reqs"] + info["num_write_reqs"] == 2 * info["lines"]
+    rep, ram = simulate_ramulator(plan, HW)
+    assert all(0 < e <= 1 for e in ram["phase_bw_efficiency"])
+    assert ram["num_read_reqs"] + ram["num_write_reqs"] == 2 * ram["lines"]
     assert rep.total_cycles >= T.schedule(plan, HW, IdealDram(HW)).total_cycles
+    # Ramulator, fed the schedule's own issue times, finishes the traffic about when it ends
+    assert 0.8 < ram["replay_end_over_total"] < 1.2
