@@ -171,6 +171,17 @@ What this shows:
 - **Hidden-layer X̄ never reaches DRAM**: the Q-28 fusion keeps it in the Input Buffer (largest
   subgraph 16.7 KB of 32 KB). So the Adaptive-Package compression of hidden layers saves
   on-chip space, not DRAM traffic, in this schedule; DRAM sees X⁽⁰⁾, W̄, and 4-bit B̄ rows.
+  - Can the input layer explain Fig.19's 2.5× from Adaptive-Package? Not in our accounting
+    (checked 2026-11-23 on the M3 runs). X⁽⁰⁾ is already counted, but its packed values
+    (x0_pkg) are only 0.3–2.3 % of DRAM bytes on the GCN datasets. Its bitmaps are 17–86 %,
+    and Fig.19's previous step already has them.
+    - Bound: if values were stored 8× larger without Adaptive-Package (e.g. in 8-bit
+      containers instead of ~1–2 bits), total DRAM would grow only 1.00–1.16× (GCN). Only
+      GIN amazon-ratings, whose dense features make x0_pkg 19 % of DRAM, reaches 2.3×.
+    - Input features (bag-of-words) have large F and are very sparse, so the bitmap
+      outweighs the values. Hidden features have small F and are dense, so values outweigh
+      the bitmap, and a 2.5× gain fits them. This suggests MEGA's Fig.19 counts hidden-layer
+      X̄ round trips through DRAM, i.e. no layer fusion in the paper's DRAM accounting [INTERP].
 - NELL has 383 subgraphs, not 257: its 186-class output layer sets the capacity to 176 (S-08).
 
 ## Results: M3 Ramulator + energy (2026-11-22)
