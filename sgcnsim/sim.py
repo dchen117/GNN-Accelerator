@@ -23,6 +23,9 @@ from . import energy, timing
 from .workload import load_workload
 
 
+RAM_ITERS, RAM_TOL, RAM_RELAX = 10, 0.01, 0.5
+
+
 def simulate_run(run_dir: str, seed: int = 0, hw: timing.HW = timing.HW(),
                  dram: str = "ramulator", verbose: bool = False) -> dict:
     t0 = time.time()
@@ -31,7 +34,12 @@ def simulate_run(run_dir: str, seed: int = 0, hw: timing.HW = timing.HW(),
     t1 = time.time()
     if dram == "ramulator":
         from megasim.dram.ramulator import fixed_point
-        rep = fixed_point(lambda d: timing.schedule(plan, hw, d), hw, verbose=verbose)
+        # damped fixed point (G-06): SGCN's aggregation is DRAM-bound and the undamped
+        # iteration oscillates; damped, it settles into a ±3 % band, recorded as `spread`
+        rep = fixed_point(lambda d: timing.schedule(plan, hw, d), hw, iters=RAM_ITERS,
+                          tol=RAM_TOL, relax=RAM_RELAX, verbose=verbose)
+        h = rep.info["ramulator"]["cycles_history"][-4:]
+        rep.info["ramulator"]["spread_last4"] = (max(h) - min(h)) / rep.total_cycles
     else:
         rep = timing.schedule(plan, hw)
     t2 = time.time()

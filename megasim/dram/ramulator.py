@@ -160,19 +160,29 @@ def latencies(trace_t: np.ndarray, first: np.ndarray, last: np.ndarray):
 
 
 def fixed_point(run, hw, iters: int = 6, tol: float = 1e-3, workdir: str | None = None,
-                verbose: bool = False):
+                verbose: bool = False, relax: float = 1.0):
     """Ramulator timing for any timing model (see module doc). `run(dram)` simulates with the
     given DRAM back-end (None = the M2 server) and returns a report with `.dram` (whose `.log`
     is the transfer log), `.total_cycles` and an `.info` dict. The call sequence of `run` must
-    not depend on timing. Used for MEGA (simulate_ramulator) and SGCN (sgcnsim)."""
+    not depend on timing. Used for MEGA (simulate_ramulator) and SGCN (sgcnsim).
+
+    relax < 1 damps the iteration: the latencies used are relax · measured + (1 − relax) ·
+    previous. MEGA converges undamped (relax = 1, DRAM is mostly idle). A DRAM-bound design
+    (SGCN) oscillates undamped: a schedule that issues too fast measures long queueing
+    latencies, which make the next schedule issue too slowly, and so on."""
     rep = run(None)
     history = [rep.total_cycles]
     stats = {}
+    prev = None
     for it in range(iters):
         tr = trace_from_log(rep.dram.log, hw)
         first, last, stats = replay(tr, workdir)
         t_log = np.array([np.ceil(e[0]) for e in rep.dram.log], dtype=np.int64)
         lf, ll = latencies(t_log, first, last)
+        if prev is not None and relax < 1:
+            lf = relax * lf + (1 - relax) * prev[0]
+            ll = relax * ll + (1 - relax) * prev[1]
+        prev = (lf, ll)
         rep = run(timing.LatencyDram(hw, lf, ll))
         history.append(rep.total_cycles)
         if verbose:

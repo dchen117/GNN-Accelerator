@@ -117,7 +117,16 @@ GCN normalization) and X⁽⁰⁾ are the same as MEGA's.
 - Writes are posted when the output is ready. A phase ends when all items and writes are done.
 - DRAM models:
   - The evaluation uses Ramulator (`megasim.dram.ramulator.fixed_point`, generalized from
-    MEGA's).
+    MEGA's), **damped**: latencies = 0.5 · measured + 0.5 · previous, up to 10 iterations,
+    stop at < 1 % change.
+    - Undamped, SGCN oscillates (PubMed: 2.7 M ↔ 88 M cycles). Its aggregation is DRAM-bound,
+      so a schedule that issues too fast measures long queueing latencies, and those make the
+      next schedule issue far too slowly.
+    - Damped, it settles into a band of about ±3 % (CiteSeer: 418 k – 453 k cycles over
+      iterations 5–12). `ramulator.spread_last4` in the JSON records the band. We report the
+      last iterate.
+    - MEGA's undamped iteration converges (its DRAM is mostly idle), so MEGA's numbers are
+      unchanged.
   - The starting point and `--dram uncontended` use a latency + transfer-time model without
     queueing. megasim's FCFS server is not used here: SGCN's call order (reads of an item,
     then its posted write) is not time order, and a write booked at its late ready time would
