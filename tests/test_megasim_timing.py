@@ -145,3 +145,25 @@ def test_simulate_runs_and_bounds(prog):
     fast = timing.simulate(p2, part.ptr, func, timing.HW(dram_bytes_per_cycle=1e12, dram_latency=0))
     assert fast.total_cycles <= rep.total_cycles
     assert rep.dram_bytes == fast.dram_bytes            # traffic does not depend on timing
+
+
+# --------------------------------------------------------------------------- S-15 X̄⁽⁰⁾ format
+def test_x0_position_format(prog):
+    """X̄⁽⁰⁾ non-zero positions in DRAM: F-bit bitmaps (Q-19) or 16-bit column indices,
+    "auto" taking the smaller. Only the DRAM stream changes, never the timing."""
+    part = partition.partition(prog)
+    p2 = partition.relabel(prog, part.order)
+    x = p2.x0
+    hw_b, hw_i, hw_a = (timing.HW(x0_format=f) for f in ("bitmap", "index", "auto"))
+    nb, lb = timing.x0_position_stream(x, part.ptr, hw_b)
+    ni, li = timing.x0_position_stream(x, part.ptr, hw_i)
+    assert (nb, ni) == ("x0_bitmap", "x0_index")
+    # 16 bits per non-zero, contiguous: lines ≈ 2·nnz / 64 (+ boundary lines per subgraph)
+    assert 2 * x.val.size / 64 <= li.sum() <= 2 * x.val.size / 64 + part.num_subgraphs
+    na, la = timing.x0_position_stream(x, part.ptr, hw_a)
+    assert la.sum() == min(lb.sum(), li.sum())
+    func = functional.run(p2)
+    rb = timing.simulate(p2, part.ptr, func, hw_b, dram=timing.IdealDram(hw_b))
+    ri = timing.simulate(p2, part.ptr, func, hw_i, dram=timing.IdealDram(hw_i))
+    assert rb.total_cycles == ri.total_cycles
+    assert rb.dram_bytes["x0_bitmap"] == lb.sum() * 64 and ri.dram_bytes["x0_index"] == li.sum() * 64

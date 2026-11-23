@@ -4,8 +4,10 @@ The simulator of the MEGA baseline. Design and the reasons for each choice:
 `docs/simulator/00-design.md` (S-xx). The hardware it implements: Q-16 … Q-30, Q-35 in
 `docs/mega-kb/04-open-questions.md`.
 
-State (2026-11-22): **M1 (functional, bit-exact), M2 (timing) and M3 (Ramulator 2.1 HBM1,
-energy, Fig.14/16/17/18 quantities) are done.** The simulator is ready to serve as the
+State (2026-11-23): **M1 (functional, bit-exact), M2 (timing) and M3 (Ramulator 2.1 HBM1,
+energy, Fig.14/16/17/18 quantities) are done.** The DRAM accounting was checked against the
+paper (S-15): X̄⁽⁰⁾'s non-zero positions now go to DRAM as column indices where that is
+smaller than the bitmaps. The simulator is ready to serve as the
 baseline; our own design will go through the same DRAM model, energy numbers and reports.
 
 ## Run
@@ -46,6 +48,11 @@ python -m megasim.report runs/hw/megasim_m3.json
 ```
 
 ```bash
+# Fig.19(b) DRAM ablation in our accounting (S-15; diagnostic)
+python -m megasim.ablation runs/hw/gcn_cora runs/hw/gcn_citeseer runs/hw/gcn_pubmed runs/hw/gcn_nell
+```
+
+```bash
 # regenerate the SRAM numbers (needs CACTI 7: github.com/HewlettPackard/cacti, `make`)
 CACTI=~/ext/cacti/cacti python -m megasim.cacti
 ```
@@ -72,6 +79,7 @@ A run directory needs `model_seed<s>.pt`, written by `python -m mega_pt.train ..
 | `dram/ramulator.py` | Transfer log → line addresses (one region per stream), runs the driver, fixed-point iteration with `timing.LatencyDram` | S-13 |
 | `cacti.py`, `cacti_28nm.json` | CACTI 7.0 runs per buffer at 28 nm (organization calibrated to Tab.IV area) and their cached results | S-14 |
 | `energy.py` | DRAM (7 pJ/bit), SRAM (CACTI per access), PU (Tab.IV power × busy cycles), leakage | S-14 |
+| `ablation.py` | Fig.19(b) DRAM steps rebuilt from the M3 streams under several accountings (diagnostic) | S-15 |
 | `report.py` | Fig.14/16/17/18-style table from a `sim.py --json` file, optionally as ratios to another design | — |
 | `sim.py` | CLI: export → partition → relabel → functional → timing (Ramulator or M2 DRAM) → energy, per run | — |
 | `synthetic.py` | Random but consistent programs, for tests and debugging without trained runs | — |
@@ -164,24 +172,17 @@ What this shows:
   of the time; DRAM is busy at most ~37 % of a sweep (CiteSeer sweep 0). This matches the
   paper's remark that DRAM cycles are mostly overlapped (§VI-D-2).
 - **NELL is bound by the bitmap scan**: 61,278 features → 240 cycles per node at 256 bits/cycle
-  (Q-23), 94 % of the run, and its X⁽⁰⁾ bitmaps are 86 % of the DRAM traffic (480 MB).
+  (Q-23), 94 % of the run. In this M2 accounting its X⁽⁰⁾ bitmaps were 86 % of the DRAM traffic
+  (480 MB). Since S-15 (2026-11-23), DRAM carries 16-bit column indices instead (0.8 MB); the
+  scan time is unchanged.
 - **W̄⁽⁰⁾ misses dominate DRAM on Cora/CiteSeer/Sage-Cora** (40–63 %): W̄⁽⁰⁾ is 90–231 KB
   against the 48 KB Weight Buffer (Q-35); the direct-mapped row cache misses on 22–46 % of
   accesses.
 - **Hidden-layer X̄ never reaches DRAM**: the Q-28 fusion keeps it in the Input Buffer (largest
   subgraph 16.7 KB of 32 KB). So the Adaptive-Package compression of hidden layers saves
   on-chip space, not DRAM traffic, in this schedule; DRAM sees X⁽⁰⁾, W̄, and 4-bit B̄ rows.
-  - Can the input layer explain Fig.19's 2.5× from Adaptive-Package? Not in our accounting
-    (checked 2026-11-23 on the M3 runs). X⁽⁰⁾ is already counted, but its packed values
-    (x0_pkg) are only 0.3–2.3 % of DRAM bytes on the GCN datasets. Its bitmaps are 17–86 %,
-    and Fig.19's previous step already has them.
-    - Bound: if values were stored 8× larger without Adaptive-Package (e.g. in 8-bit
-      containers instead of ~1–2 bits), total DRAM would grow only 1.00–1.16× (GCN). Only
-      GIN amazon-ratings, whose dense features make x0_pkg 19 % of DRAM, reaches 2.3×.
-    - Input features (bag-of-words) have large F and are very sparse, so the bitmap
-      outweighs the values. Hidden features have small F and are dense, so values outweigh
-      the bitmap, and a 2.5× gain fits them. This suggests MEGA's Fig.19 counts hidden-layer
-      X̄ round trips through DRAM, i.e. no layer fusion in the paper's DRAM accounting [INTERP].
+  - Fig.19's 2.5× from Adaptive-Package: a hidden-layer DRAM round trip does not explain it
+    either (1.07–1.14×, checked 2026-11-23 with `megasim.ablation`). Fusion stays; see S-15.
 - NELL has 383 subgraphs, not 257: its 186-class output layer sets the capacity to 176 (S-08).
 
 ## Results: M3 Ramulator + energy (2026-11-22)
@@ -190,16 +191,20 @@ What this shows:
 HBM1 256 GB/s in Ramulator 2.1 (S-13), energy per S-14. *DRAM stall* = share of the time lost to
 DRAM (Fig.20(a)): 1 − time with data arriving instantly / time.
 
-| Run | K | Time µs | DRAM MB | Energy µJ | DRAM % | SRAM % | PU % | Leakage % | Row hit | DRAM stall |
-|---|---|---|---|---|---|---|---|---|---|---|
-| gcn_cora | 11 | 58.8 | 1.70 | 119.2 | 83.7 | 7.6 | 1.3 | 7.4 | 0.92 | 0.8 % |
-| gcn_citeseer | 14 | 91.0 | 5.03 | 323.3 | 91.3 | 3.8 | 0.7 | 4.2 | 0.96 | 0.3 % |
-| gcn_pubmed | 80 | 441.9 | 7.20 | 573.5 | 73.8 | 12.5 | 2.1 | 11.6 | 0.87 | 0.2 % |
-| gcn_nell | 383 | 16,687 | 556.3 | 36,331 | 89.9 | 2.1 | 1.0 | 6.9 | 0.97 | 0.0 % |
-| gin_cora | 11 | 60.0 | 1.70 | 119.5 | 83.5 | 7.6 | 1.3 | 7.6 | 0.92 | 0.5 % |
-| gin_citeseer | 14 | 82.7 | 5.03 | 321.5 | 91.8 | 3.7 | 0.6 | 3.9 | 0.96 | 1.2 % |
-| gin_amazon-ratings | 99 | 1,570 | 6.98 | 895.9 | 45.8 | 23.6 | 4.2 | 26.5 | 0.86 | 0.0 % |
-| sage_cora | 22 | 97.5 | 4.21 | 281.8 | 87.7 | 6.2 | 0.9 | 5.2 | 0.94 | 0.5 % |
+Updated 2026-11-23 with S-15's X̄⁽⁰⁾ position format (column indices where smaller; times are
+unchanged). The original bitmap accounting gave Cora 1.70 MB / 119.2 µJ, CiteSeer 5.03 / 323.3,
+NELL 556.3 / 36,331, GIN-Cora 1.70, GIN-CiteSeer 5.03, Sage-Cora 4.21 (`--x0-format bitmap`).
+
+| Run | K | Time µs | DRAM MB | Energy µJ | DRAM % | SRAM % | PU % | Leakage % | Row hit | DRAM stall | X̄⁽⁰⁾ positions |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| gcn_cora | 11 | 58.8 | 1.33 | 97.5 | 80.1 | 9.2 | 1.6 | 9.1 | 0.91 | 0.8 % | index |
+| gcn_citeseer | 14 | 91.0 | 3.75 | 248.6 | 88.7 | 4.9 | 0.9 | 5.5 | 0.95 | 0.3 % | index |
+| gcn_pubmed | 80 | 441.9 | 7.20 | 573.5 | 73.8 | 12.5 | 2.1 | 11.6 | 0.87 | 0.2 % | bitmap |
+| gcn_nell | 383 | 16,687 | 76.07 | 8,132 | 54.9 | 9.5 | 4.5 | 31.0 | 0.92 | 0.0 % | index |
+| gin_cora | 11 | 60.0 | 1.33 | 97.7 | 79.8 | 9.3 | 1.6 | 9.3 | 0.91 | 0.5 % | index |
+| gin_citeseer | 14 | 82.7 | 3.75 | 246.8 | 89.3 | 4.8 | 0.8 | 5.1 | 0.95 | 1.2 % | index |
+| gin_amazon-ratings | 99 | 1,570 | 6.98 | 895.9 | 45.8 | 23.6 | 4.2 | 26.5 | 0.86 | 0.0 % | bitmap |
+| sage_cora | 22 | 97.5 | 3.84 | 260.0 | 86.6 | 6.7 | 1.0 | 5.7 | 0.94 | 0.5 % | index |
 
 Findings:
 - **Ramulator changes the time by at most 0.7 % compared with the M2 server** (−0.7 … +0.1 %).
@@ -207,8 +212,10 @@ Findings:
   - The fixed point converges in 1–5 iterations.
   - DRAM stalls are 0–1.2 % of the time. This agrees with MEGA's remark that most DRAM cycles
     are overlapped (§VI-D-2) and with Fig.20(a), where MEGA has the lowest stall share.
-- **DRAM dominates energy** (74–92 %), except on amazon-ratings (46 %): there W̄ is resident,
-  X⁽⁰⁾ is dense and small, and the run is long, so leakage and SRAM weigh more. Fig.1 cites
+- **DRAM dominates energy** (74–89 %), except on amazon-ratings (46 %) and NELL (55 %).
+  - Amazon-ratings: W̄ is resident, X⁽⁰⁾ is dense and small, and the run is long, so leakage
+    and SRAM weigh more.
+  - NELL: without its input bitmaps in DRAM, its 16.7 ms run makes leakage 31 %. Fig.1 cites
   90.2 % DRAM energy for a prior accelerator. MEGA's own split is only given relative to
   HyGCN (Fig.18).
 - **On-chip power** (SRAM + PU + leakage over the run) is 220–356 mW, compared with Tab.IV's

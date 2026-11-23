@@ -15,6 +15,12 @@ A 2-layer GCN runs as three phases (G-03):
                combination engine; logits written dense.
 Deeper models repeat C with ReLU + BEICSR output.
 
+Residual connections (SGCN Eq.(2), §V-F; `build_plan(..., residual=True)`): a phase-C layer
+with F_in = F_out computes X⁽ˡ⁺¹⁾ = ReLU(Ã·X⁽ˡ⁾·W⁽ˡ⁾ + X⁽ˡ⁾). The systolic array's output
+registers are initialized with the strip's own X⁽ˡ⁾ rows ("initialized with S instead of
+zero"), so the residual costs no MACs, only reads of those rows (all slices, BEICSR) through
+the cache, issued with the strip's other reads (G-08).
+
 Work is split into strips of 32 destination vertices (sparsity-aware cooperation, SGCN §V-C):
 strip k goes to aggregation engine k mod 4. Inside a strip the engine walks slice by slice
 (feature slicing, C = 96), and for each slice over the strip's vertices and their in-edges.
@@ -155,6 +161,7 @@ class Plan:
     dims: list
     w0_tile: int
     phases: list
+    residual_layers: list = field(default_factory=list)   # layers l with the + X⁽ˡ⁾ term
 
 
 def _per_item(item_of_access: np.ndarray, items: int) -> np.ndarray:
@@ -227,9 +234,32 @@ def _beicsr_writes(x: np.ndarray, lay: Layout, base: int, hw: HW, K: int):
 X_LAYER_STRIDE = 1 << 26       # region offset between BEICSR layers inside sg_x (64 MB)
 
 
-def build_plan(w: Workload, hw: HW = HW()) -> Plan:
+def _residual_reads(sl: np.ndarray, lay: Layout, base: int, hw: HW, K: int):
+    """Cached reads of every strip's own X⁽ˡ⁾ rows (all slices), in vertex → slice order:
+    (item ptr, addresses). `sl` is (n, S) lines per row slice."""
+    n, S = sl.shape
+    v = np.repeat(np.arange(n), S)
+    s = np.tile(np.arange(S), n)
+    addr = _expand(base + v * lay.stride + lay.off[s], sl.ravel(), hw.line)
+    return _per_item(np.repeat(v // hw.strip, sl.ravel()), K), addr
+
+
+def _merge_items(pa: np.ndarray, aa: np.ndarray, pb: np.ndarray, ab: np.ndarray):
+    """Concatenate two per-item access lists item by item (a's accesses first)."""
+    K = pa.size - 1
+    item = np.concatenate([np.repeat(np.arange(K), np.diff(pa)), np.repeat(np.arange(K), np.diff(pb))])
+    addr = np.concatenate([aa, ab])
+    o = np.argsort(item, kind="stable")
+    return _per_item(item[o], K), addr[o]
+
+
+def build_plan(w: Workload, hw: HW = HW(), residual: bool = False) -> Plan:
+    """Access streams of every phase plus the cache simulation. `residual=True` adds the
+    + X⁽ˡ⁾ term to every phase-C layer with F_in = F_out (G-08); the hidden features in `w`
+    must then come from a model with those connections (they set the sparsity)."""
     L = w.layers
     phases = []
+    res_layers: list = []
     A, wt = _phase_comb0(w, hw)
     phases.append(A)
     # B: aggregate T (dense), ReLU, compress X⁽¹⁾ (or logits for a 1-layer model)
@@ -249,6 +279,12 @@ def build_plan(w: Workload, hw: HW = HW()) -> Plan:
         X = beicsr_layout(Fi, hw)
         sl = slice_lines(X, slice_nnz(w.hidden[l - 1], X), w.n, hw)
         ptr, addr, cyc, topo, rows, K = _gather(w, hw, sl, X, l * X_LAYER_STRIDE)
+        if residual and Fi == Fo:
+            # engine cycles stay those of the aggregation reads: the residual rows go to the
+            # systolic array's registers, not through the SIMD engines
+            rp, ra = _residual_reads(sl, X, l * X_LAYER_STRIDE, hw, K)
+            ptr, addr = _merge_items(ptr, addr, rp, ra)
+            res_layers.append(l)
         comb = rows * Fi * Fo / hw.comb_macs
         pre = {"sg_wl": Fi * Fo * hw.word / hw.line}
         if l < L - 1:
@@ -262,7 +298,8 @@ def build_plan(w: Workload, hw: HW = HW()) -> Plan:
                        float(w.n) * Fi * Fo, pre)
         phases.append(ph)
     simulate_cache(phases, hw)
-    return Plan(workload=w.name, n=w.n, dims=list(w.dims), w0_tile=wt, phases=phases)
+    return Plan(workload=w.name, n=w.n, dims=list(w.dims), w0_tile=wt, phases=phases,
+                residual_layers=res_layers)
 
 
 def simulate_cache(phases: list, hw: HW) -> None:

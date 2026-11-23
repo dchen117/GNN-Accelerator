@@ -240,6 +240,84 @@ Fig.18's four categories:
 - **Check:** on-chip power from the model, (SRAM + PU + leakage) / time, can be compared
   with Tab.IV's 195 mW (README, M3 results).
 
+### S-15 — DRAM accounting check against the paper; X̄⁽⁰⁾ positions as column indices (2026-11-23)
+The question was why our MEGA DRAM disagreed with the paper: Fig.19's Adaptive-Package gain,
+and NELL, where our MEGA moved more DRAM than SGCN (0.68×, against the paper's 23.5×).
+
+**Method: rebuild Fig.19(b) in our accounting** (`python -m megasim.ablation`, GCN runs).
+Fig.19(b) is MEGA's own DRAM breakdown. It adds MEGA's techniques one at a time and states
+each step's gain (p.12): DQ + Bitmap 5.8×, Adaptive-Package 2.5×, Condense-Edge 4.4× (11.6×
+on NELL). Each step is built from the M3 streams by swapping only what that step changes (see
+the module docstring). It was run with hidden-layer X̄ fused (S-10) or making a DRAM round
+trip, and with X̄⁽⁰⁾'s bitmaps counted or not:
+
+| step gain (geomean, 4 GCN datasets) | paper | fused, bitmaps | fused, no X̄⁽⁰⁾ bitmaps | round trip, bitmaps | round trip, no X̄⁽⁰⁾ bitmaps |
+|---|---|---|---|---|---|
+| S0→S1 DQ + Bitmap | 5.8 | 11.2 | 20.6 | 10.7 | 19.2 |
+| S1→S2 Adaptive-Package | 2.5 | 1.01 | 1.02 | 1.07 | 1.08 |
+| S2→S3 Condense-Edge | 4.4 | 1.40 | 1.55 | 1.34 | 1.45 |
+| S2→S3 on NELL | 11.6 | 1.02 | 1.13 | 1.02 | 1.12 |
+
+Findings:
+- **No consistent accounting reproduces Fig.19.**
+  - Adaptive-Package can only change how X̄'s values are stored. In every variant those
+    values are a few percent of DRAM; B̄ rows, W̄ and the bitmaps dominate.
+  - Condense-Edge stores each external row once per target subgraph. A naive design also
+    fetches it about once per window, so packing gains at most ~2×.
+  - Fig.19 is averaged over the datasets, and its steps S0–S2 are not described. We treat it
+    as qualitative and do not calibrate to it.
+- **Hidden-layer round trips do not explain the 2.5×** (1.07–1.14×). The earlier hypothesis
+  (README, M2 notes) is dropped, and the Q-28 fusion, which the paper describes, stays.
+- **On NELL the paper's MEGA cannot be moving 480 MB of input bitmaps.** Three statements
+  rule it out:
+  1. Condense-Edge alone gives 11.6× on NELL (p.12). That needs aggregation traffic to
+     dominate NELL. With the bitmaps counted, Condense-Edge can give at most 1.13×.
+  2. Fig.16 puts MEGA 23.5× below SGCN on NELL. SGCN reads NELL's one-hot X⁽⁰⁾ in CSR
+     (SGCN p.12 "using CSR format for input features"); ours moves 378 MB, and even a much
+     heavier SGCN would not make 23.5× out of a 556 MB MEGA.
+  3. Fig.16's DRAM ratio over SGCN is larger on CiteSeer (7.4×) than on Cora (2.8×). With
+     the bitmaps counted, our MEGA was relatively heavier on CiteSeer, whose 3,703-feature
+     bitmaps are 2.6× Cora's.
+- **Correction.** The SGCN notes (2026-11-23) said HyGCN's 16 GB dense NELL input "leaves MEGA
+  ≈ 67 MB". That read a lower bound as an upper bound. HyGCN reads at least 16 GB, so
+  Fig.16's 239.5× puts MEGA at *at least* 67 MB. HyGCN's total is not known, so Fig.16 bounds
+  MEGA's NELL traffic only from below. The three statements above are what rule the bitmaps
+  out.
+
+**Decision (ours; Q-19 left the DRAM layout open).** X̄⁽⁰⁾'s non-zero positions go to DRAM in
+the smaller of two formats, chosen once per layer (`HW.x0_format = "auto"`, default):
+- Q-19's bitmaps, F bits per node; or
+- one 16-bit column index per non-zero (CSR column array; F0 ≤ 65,536 for every dataset).
+
+| | Cora | CiteSeer | PubMed | NELL | Amazon-Ratings |
+|---|---|---|---|---|---|
+| X̄⁽⁰⁾ density | 1.3 % | 0.9 % | 6.6 % | 0.01 % | 72 % |
+| format chosen | index | index | bitmap | index | bitmap |
+
+- **Only the DRAM stream changes.** On chip, the Decoder still receives the bitmap, the
+  combination still scans F0 bits per node (Q-23), and SRAM is still counted with bitmaps.
+  The index list is the bitmap's popcount-ordered positions, so it can be expanded on the
+  way in.
+  - Why keep the scan time: it is the conservative choice for MEGA. Fig.14 puts MEGA only
+    2.6× ahead of SGCN on NELL; without the scan our MEGA would be about 50× ahead (§ MEGA vs
+    SGCN in `docs/sgcn/00-design.md`).
+- **Why this format.** It is the input-layer format SGCN uses for one-hot inputs, so both
+  designs read X⁽⁰⁾ alike. It changes nothing where bitmaps are smaller (PubMed,
+  Amazon-Ratings). It is the smallest change that removes the inconsistency. Fidelity rule:
+  the paper does not state the DRAM layout of X̄⁽⁰⁾, and its NELL numbers contradict the
+  bitmap reading.
+- **Effect (M3, Ramulator):**
+
+  | | Cora | CiteSeer | PubMed | NELL |
+  |---|---|---|---|---|
+  | DRAM (MB), before → after | 1.70 → 1.33 | 5.03 → 3.75 | 7.20 → 7.20 | 556.3 → 76.1 |
+  | time | unchanged | unchanged | unchanged | unchanged |
+
+- `--x0-format bitmap` restores the M3 accounting (`runs/hw/megasim_m3_bitmap.json`).
+- **Not changed: W̄⁽⁰⁾ row-cache misses** (Q-35), now 51–79 % of DRAM on Cora/CiteSeer/
+  Sage-Cora. The paper does not say how it handles a W̄ larger than the Weight Buffer, and
+  nothing in it contradicts our row cache.
+
 ## 3. Milestones
 
 | | Content | State |

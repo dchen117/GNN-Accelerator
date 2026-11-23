@@ -449,6 +449,13 @@ should say which kind it is: filling a gap, or departing from a stated detail.
     - NELL X⁽⁰⁾: 7.5 KB of bitmap per node, 482 MB in total.
     - So X⁽⁰⁾'s stored CR is ≤ 32 by construction. This is MEGA's stated format (bitmaps per
       node, p.6), so we report it and do not fix it.
+  - **Amended 2026-11-23 (DRAM only; `docs/simulator/00-design.md` S-15).** In DRAM,
+    X̄⁽⁰⁾'s positions take the smaller of the bitmaps and 16-bit column indices: indices for
+    Cora/CiteSeer/NELL, bitmaps for PubMed and Amazon-Ratings.
+    - Why: the paper's NELL numbers (Condense-Edge 11.6×, 23.5× less DRAM than SGCN) rule out
+      482 MB of input bitmaps in DRAM.
+    - Unchanged: the bitmaps on chip, the combination's bitmap scan, hidden layers, and the
+      memory/CR numbers above. `--x0-format bitmap` gives the original accounting.
 
 ### Q-20 — Fig.9(b) Node1 bitmap `minor`
 - [DERIVED] Node1 = 01 10 00 11 00 → non-zero pattern 11010, but Fig.9(b) shows 11011 (p.6). The

@@ -70,6 +70,11 @@ class HW:
     dram_latency: int = 100                # cycles per transfer (ours, M2 only)
     line: int = 64                         # access granularity in bytes
     clock_ghz: float = 1.0
+    # DRAM format of X̄⁽⁰⁾'s non-zero positions (S-15): "bitmap" = Q-19's F bits per node;
+    # "index" = a 16-bit column index per non-zero; "auto" = whichever is smaller for the
+    # whole layer. Only the DRAM stream changes: on chip the Decoder still gets (and the
+    # combination still scans) the bitmap, so timing and SRAM counts are those of "bitmap".
+    x0_format: str = "auto"
 
     @property
     def region_bytes(self) -> int:       # Sparse Buffer: 16 equal regions (Q-27)
@@ -201,6 +206,27 @@ def bitmap_lines(x: SparseRows, ptr: np.ndarray, hw: HW) -> tuple[np.ndarray, np
     wbits = -(-x.F // package.BITMAP_WORD) * package.BITMAP_WORD
     nbits = np.diff(ptr) * wbits
     return lines_touched(ptr[:-1] * wbits, nbits, hw.line * 8), nbits
+
+
+def index_lines(x: SparseRows, ptr: np.ndarray, hw: HW) -> tuple[np.ndarray, np.ndarray]:
+    """X̄⁽⁰⁾ non-zero positions as one 16-bit column index per non-zero, contiguous in node
+    order (the CSR column array; the per-node counts are the bitmap popcounts the Decoder
+    already needs, S-15)."""
+    assert x.F <= 1 << 16, "16-bit column indices need F ≤ 65,536"
+    nbits = seg_sum(x.nnz_per_row, ptr).astype(np.int64) * 16
+    start = x.ptr[ptr[:-1]] * 16
+    return lines_touched(start, nbits, hw.line * 8), nbits
+
+
+def x0_position_stream(x: SparseRows, ptr: np.ndarray, hw: HW) -> tuple[str, np.ndarray]:
+    """(stream name, lines per subgraph) of X̄⁽⁰⁾'s non-zero positions in DRAM (hw.x0_format)."""
+    bm_l, bm_b = bitmap_lines(x, ptr, hw)
+    ix_l, ix_b = index_lines(x, ptr, hw)
+    fmt = hw.x0_format
+    if fmt == "auto":
+        fmt = "index" if ix_b.sum() < bm_b.sum() else "bitmap"
+    assert fmt in ("bitmap", "index"), hw.x0_format
+    return ("x0_bitmap", bm_l) if fmt == "bitmap" else ("x0_index", ix_l)
 
 
 def contiguous_lines(ptr: np.ndarray, bits_per_node: int, hw: HW) -> np.ndarray:
@@ -516,7 +542,8 @@ def simulate(prog: Program, ptr: np.ndarray, func: list[LayerResult], hw: HW = H
     lines0 = dict(dram.lines)
     busy0 = dram.busy
     x0_pkg, _ = package_lines(prog.x0, prog.layers[0].bits, ptr, hw)
-    x0_bm, _ = bitmap_lines(prog.x0, ptr, hw)
+    x0_pos_name, x0_pos = x0_position_stream(prog.x0, ptr, hw)
+    info["x0_format"] = x0_pos_name
     w = wtraf[0]
     first_w = {"weights": w["load_lines"]}
     if eid_resident:
@@ -528,7 +555,7 @@ def simulate(prog: Program, ptr: np.ndarray, func: list[LayerResult], hw: HW = H
     pending_t = 0.0
     comb0_sub, cond0_sub = seg_sum(comb[0], ptr), seg_sum(cond[0], ptr)
     for k in range(K):
-        rd = {"x0_pkg": x0_pkg[k], "x0_bitmap": x0_bm[k], "meta": meta_lines[k],
+        rd = {"x0_pkg": x0_pkg[k], x0_pos_name: x0_pos[k], "meta": meta_lines[k],
               "w_miss": w["miss_lines"][k]}
         if not eid_resident:
             rd["eid"] = eid_lines_by_sub[k]

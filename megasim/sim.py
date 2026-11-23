@@ -62,10 +62,13 @@ def main(argv=None):
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--json", default=None)
     p.add_argument("--dram", choices=["ramulator", "m2"], default="ramulator")
+    p.add_argument("--x0-format", choices=["auto", "bitmap", "index"], default="auto",
+                   help="DRAM format of X̄⁽⁰⁾'s non-zero positions (S-15); bitmap = M3 accounting")
     a = p.parse_args(argv)
+    hw = timing.HW(x0_format=a.x0_format)
     out = []
     for r in a.runs:
-        res = simulate_run(r, a.seed, dram=a.dram)
+        res = simulate_run(r, a.seed, hw=hw, dram=a.dram)
         out.append(res)
         print(json.dumps(res, indent=1, default=float))
     print("\nSUMMARY  (cycles at 1 GHz; util = busy / total)")

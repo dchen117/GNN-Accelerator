@@ -103,3 +103,33 @@ def test_ramulator_calibrated_schedule():
     assert rep.total_cycles >= T.schedule(plan, HW, IdealDram(HW)).total_cycles
     # Ramulator, fed the schedule's own issue times, finishes the traffic about when it ends
     assert 0.8 < ram["replay_end_over_total"] < 1.2
+
+
+def synthetic_deep(n=300, dims=(200, 128, 128, 5), deg=4, seed=0):
+    """3-layer workload with a 128 → 128 hidden layer (where a residual applies)."""
+    w = synthetic(n, (dims[0], dims[1], dims[3]), deg, seed=seed)
+    rng = np.random.default_rng(seed + 1)
+    h2 = rng.random((n, dims[2])).astype(np.float32)
+    h2[rng.random(h2.shape) > 0.3] = 0
+    return Workload("syn_deep", n, list(dims), w.ptr, w.src, w.x0, [w.hidden[0], h2])
+
+
+def test_residual_reads():
+    w = synthetic_deep()
+    base = T.build_plan(w, HW)
+    res = T.build_plan(w, HW, residual=True)
+    assert base.residual_layers == [] and res.residual_layers == [1]   # only 128 → 128
+    c0, c1 = base.phases[2], res.phases[2]                             # phase C of layer 1
+    X = T.beicsr_layout(128, HW)
+    own = T.slice_lines(X, T.slice_nnz(w.hidden[0], X), w.n, HW).sum()
+    # the residual adds each vertex's own X⁽¹⁾ row once, and no engine cycles or MACs
+    assert c1.acc_addr.size == c0.acc_addr.size + own
+    assert np.array_equal(c1.engine_cycles, c0.engine_cycles)
+    assert np.array_equal(c1.comb_cycles, c0.comb_cycles)
+    # the strip's own rows were just read through the self-loop edges: mostly hits
+    extra_miss = (c1.hit == 0).sum() - (c0.hit == 0).sum()
+    assert 0 <= extra_miss < 0.1 * own
+    # the last layer (128 → 5) and the other phases are unchanged
+    assert np.array_equal(base.phases[3].acc_addr, res.phases[3].acc_addr)
+    rep = T.schedule(res, HW)
+    assert rep.total_cycles >= T.schedule(base, HW).total_cycles * 0.99

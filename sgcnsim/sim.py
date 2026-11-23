@@ -61,10 +61,10 @@ def simulate_ramulator(plan, hw: timing.HW):
 
 
 def simulate_run(run_dir: str, seed: int = 0, hw: timing.HW = timing.HW(),
-                 dram: str = "ramulator", verbose: bool = False) -> dict:
+                 dram: str = "ramulator", verbose: bool = False, residual: bool = False) -> dict:
     t0 = time.time()
     w = load_workload(run_dir, seed)
-    plan = timing.build_plan(w, hw)
+    plan = timing.build_plan(w, hw, residual=residual)
     t1 = time.time()
     if dram == "ramulator":
         rep, ram = simulate_ramulator(plan, hw)
@@ -75,7 +75,7 @@ def simulate_run(run_dir: str, seed: int = 0, hw: timing.HW = timing.HW(),
     db = rep.dram_bytes
     out = {
         "run": w.name, "design": "sgcn", "dram_model": dram,
-        "subgraphs": "—", "w0_tile": plan.w0_tile,
+        "subgraphs": "—", "w0_tile": plan.w0_tile, "residual_layers": plan.residual_layers,
         "cycles": int(round(rep.total_cycles)), "time_us": rep.total_cycles / hw.clock_ghz / 1e3,
         "cycles_ideal_dram": float(ideal.total_cycles),
         "dram_stall_share": 1 - ideal.total_cycles / rep.total_cycles,
@@ -101,10 +101,12 @@ def main(argv=None):
     p.add_argument("--json", default=None)
     p.add_argument("--dram", choices=["ramulator", "uncontended"], default="ramulator")
     p.add_argument("-v", "--verbose", action="store_true")
+    p.add_argument("--residual", action="store_true",
+                   help="+X⁽ˡ⁾ residual on layers with F_in = F_out (G-08; none in MEGA's 2-layer GCNs)")
     a = p.parse_args(argv)
     out = []
     for r in a.runs:
-        res = simulate_run(r, a.seed, dram=a.dram, verbose=a.verbose)
+        res = simulate_run(r, a.seed, dram=a.dram, verbose=a.verbose, residual=a.residual)
         out.append(res)
         print(json.dumps(res, indent=1, default=float))
     print("\nSUMMARY (SGCN, cycles at 1 GHz)")

@@ -42,7 +42,7 @@ CONFIG = HERE / "hbm1_256GBps.yaml"
 REGION_BITS = 28                     # 256 MB per stream region; 16 regions = the 4 GB stack
 # stream → region. A stream that is written in one sweep and read in the next shares the
 # region with its reader (same addresses, same row behaviour).
-REGION = {"x0_pkg": 0, "x0_bitmap": 1, "meta": 2, "weights": 3, "w_miss": 3, "eid": 4,
+REGION = {"x0_pkg": 0, "x0_bitmap": 1, "x0_index": 1, "meta": 2, "weights": 3, "w_miss": 3, "eid": 4,
           "csc": 5, "b_int_w": 6, "b_int_r": 6, "sparse_w": 7, "sparse_r": 7, "logits": 8,
           # SGCN (sgcnsim/timing.py): CSR topology, CSR X⁽⁰⁾, W⁽⁰⁾ rows (cache misses), dense
           # T = X⁽⁰⁾W⁽⁰⁾, BEICSR features, systolic-array weights
