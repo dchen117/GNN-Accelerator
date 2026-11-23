@@ -27,6 +27,9 @@ python -m sgcnsim.compare runs/hw/megasim_m3.json runs/hw/sgcn.json
 python -m pytest tests/test_sgcnsim.py -q
 ```
 
+`--residual` adds the + X⁽ˡ⁾ residual term to every aggregation-first layer with F_in = F_out
+(G-08). MEGA's 2-layer GCNs have no such layer, so it changes nothing on them.
+
 `--dram uncontended` skips Ramulator: each transfer gets latency + its own transfer time and
 no queueing. It is useful for quick debugging only.
 
@@ -35,7 +38,7 @@ no queueing. It is useful for quick debugging only.
 | File | What | Decisions |
 |---|---|---|
 | `workload.py` | FP32 GCN of the run (its pretraining checkpoint): graph CSR, X⁽⁰⁾ CSR, hidden ReLU outputs | G-02 |
-| `timing.py` | Layouts (dense / in-place sliced BEICSR); phases A (X⁽⁰⁾W⁽⁰⁾ on the sparse engines), B (Ã·T + compress), C (Ã·X then combination); cache simulation; event schedule | G-03 … G-06 |
+| `timing.py` | Layouts (dense / in-place sliced BEICSR); phases A (X⁽⁰⁾W⁽⁰⁾ on the sparse engines), B (Ã·T + compress), C (Ã·X then combination, optional residual); cache simulation; event schedule | G-03 … G-06, G-08 |
 | `cache.py`, `cache.cpp` | Set-associative LRU over line addresses | G-05 |
 | `energy.py`, `cacti.py`, `cacti_28nm.json` | DRAM 7 pJ/bit, CACTI cache read/fill/leakage, 1.99 pJ per 32-bit MAC | G-07 |
 | `sim.py` | CLI. Its JSON has megasim's keys, so `megasim.report --baseline` also works | — |

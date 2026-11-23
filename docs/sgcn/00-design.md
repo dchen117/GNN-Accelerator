@@ -162,6 +162,26 @@ GCN normalization) and X⁽⁰⁾ are the same as MEGA's.
     configuration.
 - **Leakage:** cache leakage from CACTI (108 mW) × run time.
 
+## G-08 Residual connections [SGCN] Eq.(2), §V-F; [OURS] details
+
+`timing.build_plan(w, hw, residual=True)`, CLI `python -m sgcnsim.sim ... --residual`.
+MEGA's 2-layer GCNs have none, so it is off in our MEGA comparison.
+
+- [SGCN] X⁽ˡ⁺¹⁾ = ReLU(Ã·X⁽ˡ⁾·W⁽ˡ⁾ + S⁽ˡ⁾): "the registers at the systolic arrays are initialized
+  with S instead of zero", then ReLU and the compressor.
+- [OURS] S⁽ˡ⁾ = X⁽ˡ⁾ (identity residual, as in the ResGCN-style models SGCN evaluates). It applies
+  to aggregation-first layers (phase C) with F_in = F_out.
+  - Layer 0 and the output layer have F_in ≠ F_out, and a projection residual is not described.
+- [OURS] Cost: each strip's own X⁽ˡ⁾ rows (all slices, BEICSR) are read through the cache with
+  the strip's other reads. There are no extra MACs (register initialization) and no extra
+  aggregation-engine cycles: the rows feed the systolic array, not the SIMD engines.
+  - The rows were usually just read through the strip's self-loop edges, so they mostly hit.
+    The test sees under 10 % extra misses.
+- The residual's real effect on SGCN is the sparser X⁽ˡ⁾ it produces (SGCN Fig.2). That comes
+  from the workload's hidden features. `load_workload` builds MEGA's 2-layer GCNs only, so a
+  residual model needs its own workload (hidden features from a model trained with the
+  connections).
+
 ## Targets (MEGA p.10–11, GCN only)
 
 The SGCN series was read from 400-dpi renders of Fig.14/16/17 and identified by recomputing
@@ -181,7 +201,7 @@ the stated geomeans:
 - We have no GCN-Reddit run (Reddit was trained for GraphSage only), so we compare on 4
   datasets.
 
-## Results (2026-11-23)
+## Results (2026-11-23, after megasim S-15)
 
 Commands:
 
@@ -193,22 +213,28 @@ python -m sgcnsim.sim runs/hw/gcn_{cora,citeseer,pubmed,nell} --json runs/hw/sgc
 python -m sgcnsim.compare runs/hw/megasim_m3.json runs/hw/sgcn.json
 ```
 
-Paper values (MEGA ÷ SGCN) are in parentheses.
+MEGA uses S-15's X̄⁽⁰⁾ position format (`docs/simulator/00-design.md`). Paper values (MEGA ÷
+SGCN) are in parentheses.
 
 | dataset | MEGA µs | SGCN µs | speedup | MEGA MB | SGCN MB | DRAM reduction | MEGA µJ | SGCN µJ | energy saving |
 |---|---|---|---|---|---|---|---|---|---|
-| Cora | 58.8 | 291.0 | 4.95× (2.79×) | 1.70 | 14.09 | 8.29× (2.84×) | 119.2 | 935.1 | 7.84× (2.88×) |
-| CiteSeer | 91.0 | 418.0 | 4.60× (2.27×) | 5.03 | 22.35 | 4.45× (7.43×) | 323.3 | 1483.1 | 4.59× (2.36×) |
+| Cora | 58.8 | 291.0 | 4.95× (2.79×) | 1.33 | 14.09 | 10.60× (2.84×) | 97.5 | 935.1 | 9.59× (2.88×) |
+| CiteSeer | 91.0 | 418.0 | 4.60× (2.27×) | 3.75 | 22.35 | 5.95× (7.43×) | 248.6 | 1483.1 | 5.97× (2.36×) |
 | PubMed | 441.9 | 2998.1 | 6.79× (2.29×) | 7.20 | 132.20 | 18.35× (6.63×) | 573.5 | 9397.1 | 16.39× (7.31×) |
-| NELL | 16,687 | 99,784 | 5.98× (2.64×) | 556.28 | 378.25 | **0.68×** (23.48×) | 36,331 | 36,742 | **1.01×** (6.47×) |
+| NELL | 16,687 | 99,784 | 5.98× (2.64×) | 76.07 | 378.25 | 4.97× (23.48×) | 8,132 | 36,742 | 4.52× (6.47×) |
 
 Geomeans:
 
 | | speedup | DRAM reduction | energy saving |
 |---|---|---|---|
-| Ours (4 datasets) | 5.51× | 4.63× | 4.94× |
+| Ours (4 datasets) | 5.51× | 8.71× | 8.07× |
 | Paper, the same 4 datasets | 2.48× | 7.57× | 4.24× |
 | Paper, all 5 (stated) | 3.6× | 7.3× | 4.5× |
+| Ours with MEGA's original bitmap accounting | 5.51× | 4.63× | 4.94× |
+
+**MEGA outperforms SGCN on every dataset in time, DRAM and energy**, as in the paper. The DRAM
+geomean is close to the paper's. Speedup is about 2.2× larger than the paper's, and energy
+about 1.9× larger.
 
 SGCN breakdown:
 
@@ -222,28 +248,58 @@ SGCN breakdown:
 On every dataset, Ramulator's replay of the schedule's own trace ends when the schedule does
 (1.00).
 
-Findings:
+### Why our MEGA ÷ SGCN differs from the paper
 
-- **Speed: MEGA is faster on every dataset, by 4.6–6.8×.** The paper gives 2.3–2.8×, so we
-  overstate the gap about 2×. Most of SGCN's time is in two places:
-  - Layer 1's combination on Tab.V's 16 MACs: rows × 128 × classes / 16, which is 52 % of
-    Cora's time and 98 % of NELL's (186 classes).
-  - Layer 0's X⁽⁰⁾·W⁽⁰⁾ on the 4 SIMD16 engines (G-03).
-  - Neither depends on our DRAM or cache choices. Only a larger combination engine than
-    Tab.V's "16 MACs for combination" would shrink them.
-- **DRAM: MEGA moves 4.5–18× less on Cora, CiteSeer and PubMed** (paper 2.8–7.4×). SGCN's
-  aggregation misses the cache on 70–90 % of neighbour reads. The graphs are not reordered
-  (Tab.V "Graph Partition: No"), and FP32 hidden features are 86–94 % dense (G-02), so
-  BEICSR saves little.
-- **NELL is the exception: SGCN moves 0.68× MEGA's DRAM, and their energy ties.** This is a
-  MEGA-side modelling issue, not an SGCN one.
-  - Our MEGA reads 480 MB of dense 61,278-bit per-node input bitmaps (86 % of its NELL
-    traffic). SGCN reads X⁽⁰⁾ as CSR (3.7 MB).
-  - The paper's MEGA cannot be doing that. HyGCN reading NELL's X⁽⁰⁾ once as dense FP32 is
-    already 16 GB, and Fig.16's 239.5× reduction leaves MEGA ≈ 67 MB in total, less than
-    those bitmaps alone.
-  - This belongs with the open MEGA DRAM-accounting question (hidden-layer fusion, Fig.19),
-    which is on hold.
-- **Energy follows DRAM** (DRAM is 58–84 % of SGCN's energy). NELL also pays 29 % leakage
-  over its 100 ms run.
-- Reddit is missing (no GCN-Reddit run). In the paper it is the largest gap (15.4× speedup).
+**Speed: the gap is on the MEGA side, and we cannot close it without leaving Tab.V or the
+accepted MEGA micro-architecture.**
+- SGCN's time has a floor that our modelling choices do not set. Tab.V's compute fixes two
+  terms:
+  - X⁽⁰⁾·W⁽⁰⁾ needs nnz(X⁽⁰⁾)·F1 MACs on the 4 × SIMD16 engines. That is already the cheapest
+    option (G-03): aggregation first would put dense Ã·X⁽⁰⁾ on the 16 MACs.
+  - The output layer needs N·F1·C MACs on the 16-MAC combination engine.
+- Even with SGCN's phases overlapping perfectly, the busiest unit bounds its time. Dividing
+  by the paper's speedup bounds the paper's MEGA from below:
+
+  | | Cora | CiteSeer | PubMed | NELL |
+  |---|---|---|---|---|
+  | SGCN busiest unit (k cycles): SIMD engines / 16 MACs | 153 / 152 | 263 / 160 | 2417 / 473 | 1932 / 97,843 |
+  | paper's MEGA must take at least (µs) | 55 | 116 | 1,056 | 37,062 |
+  | our MEGA (µs) | 58.8 | 91.0 | 441.9 | 16,687 |
+
+- So on PubMed and NELL the paper's MEGA is at least 2.2–2.4× slower than ours, whatever the
+  SGCN model.
+  - Our MEGA is combination-bound (91–97 % BSE utilization), so the difference lies in how
+    fast the Combination Tiles are taken to be (Q-21/Q-23/Q-24) or in the per-node
+    bitwidths.
+  - Bitwidths explain at most part of it. The hidden-layer bits per element (M1 table in
+    `megasim/README.md`, against Tab.VI's average bits) are higher than Tab.VI on Cora
+    (2.53 vs 1.70) and CiteSeer (2.25 vs 1.87), and lower on PubMed (1.73 vs 2.50).
+    - Fewer bits could account for up to ~1.4× on PubMed, not 2.4×.
+    - NELL has no Tab.VI entry.
+  - We leave the accepted tile model as it is. A slower interpretation would only be a
+    guess fitted to the ratio.
+- With our SGCN at its own floor, our speedups sit 1.8–3.0× above the paper's.
+
+**DRAM: close on average, with per-dataset scatter we cannot attribute.**
+- Cora (10.6× vs 2.84×) and PubMed (18.4× vs 6.6×): SGCN reads a neighbour's row per edge.
+  - It has a 392 KB cache, no reordering (Tab.V "Graph Partition: No") and 86–94 %-dense FP32
+    hidden features.
+  - So about E × 512 B per layer is inherent: 55 MB per layer on PubMed.
+  - The paper's ratio would need either a 2–3× lighter SGCN or a 2–3× heavier MEGA there.
+    Nothing in either paper says which.
+- NELL (5.0× vs 23.5×): our SGCN's NELL traffic is W⁽⁰⁾ rows (106 MB), dense T (129 MB) and
+  logits (49 MB). MEGA's is logits (23 MB, 16-bit × 186 classes) and Condense regions (27 MB).
+- Fig.19 cannot calibrate MEGA's DRAM: no single accounting reproduces it (S-15).
+
+**Energy** follows DRAM: DRAM is 58–84 % of SGCN's energy and 55–89 % of MEGA's. SGCN also pays
+120 pJ per cache read (16-way lookup, G-07).
+
+### What changed on 2026-11-23
+
+- **NELL used to be the exception** (MEGA 0.68× SGCN's DRAM, energy tied). That came from
+  480 MB of dense 61,278-bit input bitmaps in MEGA's DRAM accounting.
+  - The paper's own numbers rule this out (S-15). MEGA now reads NELL's positions as 16-bit
+    indices, as SGCN does with CSR.
+  - Our earlier note bounded the paper's MEGA at "≈ 67 MB" from HyGCN's 16 GB input. That
+    inverted a lower bound and is corrected in S-15.
+- Reddit is still missing (no GCN-Reddit run).
