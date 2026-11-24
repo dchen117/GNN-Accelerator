@@ -456,6 +456,8 @@ should say which kind it is: filling a gap, or departing from a stated detail.
       482 MB of input bitmaps in DRAM.
     - Unchanged: the bitmaps on chip, the combination's bitmap scan, hidden layers, and the
       memory/CR numbers above. `--x0-format bitmap` gives the original accounting.
+    - Needs an index → bitmap expander in front of the Input Buffer, which MEGA does not
+      describe (S-15). Per node, DRAM holds a 16-bit count + 16-bit indices.
 
 ### Q-20 — Fig.9(b) Node1 bitmap `minor`
 - [DERIVED] Node1 = 01 10 00 11 00 → non-zero pattern 11010, but Fig.9(b) shows 11011 (p.6). The

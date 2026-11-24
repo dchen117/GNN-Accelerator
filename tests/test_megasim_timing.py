@@ -158,8 +158,9 @@ def test_x0_position_format(prog):
     nb, lb = timing.x0_position_stream(x, part.ptr, hw_b)
     ni, li = timing.x0_position_stream(x, part.ptr, hw_i)
     assert (nb, ni) == ("x0_bitmap", "x0_index")
-    # 16 bits per non-zero, contiguous: lines ≈ 2·nnz / 64 (+ boundary lines per subgraph)
-    assert 2 * x.val.size / 64 <= li.sum() <= 2 * x.val.size / 64 + part.num_subgraphs
+    # 16 bits per non-zero + a 16-bit count per node, contiguous (+ boundary lines per subgraph)
+    words = x.val.size + x.n
+    assert 2 * words / 64 <= li.sum() <= 2 * words / 64 + part.num_subgraphs
     na, la = timing.x0_position_stream(x, part.ptr, hw_a)
     assert la.sum() == min(lb.sum(), li.sum())
     func = functional.run(p2)

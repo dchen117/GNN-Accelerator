@@ -294,13 +294,33 @@ the smaller of two formats, chosen once per layer (`HW.x0_format = "auto"`, defa
 | X̄⁽⁰⁾ density | 1.3 % | 0.9 % | 6.6 % | 0.01 % | 72 % |
 | format chosen | index | index | bitmap | index | bitmap |
 
-- **Only the DRAM stream changes.** On chip, the Decoder still receives the bitmap, the
-  combination still scans F0 bits per node (Q-23), and SRAM is still counted with bitmaps.
-  The index list is the bitmap's popcount-ordered positions, so it can be expanded on the
-  way in.
-  - Why keep the scan time: it is the conservative choice for MEGA. Fig.14 puts MEGA only
-    2.6× ahead of SGCN on NELL; without the scan our MEGA would be about 50× ahead (§ MEGA vs
-    SGCN in `docs/sgcn/00-design.md`).
+- **Format in DRAM:** per node, a 16-bit non-zero count followed by its 16-bit column
+  indices, contiguous in node order. The count stands in for the bitmap popcount the Decoder
+  uses to find where a node's values end in the package stream (Q-19). The counts were
+  missing from the first version (2026-11-23) and were added on 2026-11-24; they add 5 KB on
+  Cora and 128 KB on NELL.
+- **Hardware compatibility: this is an addition to MEGA, not a format MEGA describes.** MEGA's
+  Input Buffer, Decoder and Parallel Sum Unit (Q-23) consume a bitmap. Reading indices needs
+  one of two front ends:
+  1. **Index → bitmap expander (what we model).** Between DRAM and the Input Buffer, a unit
+     clears the node's F-bit bitmap and sets one bit per index. Everything downstream is
+     unchanged, so the timing and SRAM counts stay those of the bitmap format.
+     - The expander writes F bits per node into the Input Buffer, which the bitmap format
+       also did, and needs one comparator/decoder per index per cycle.
+     - Its logic area and energy are not modelled. That is small next to DRAM, but it is not
+       in Tab.IV.
+     - NELL's 7.7 KB bitmap per node still has to fit the Input Buffer, as before.
+  2. **Indices straight to the Weight Index Generator.** The indices *are* the W̄ row indices
+     the Parallel Sum Unit computes from the bitmap, so the scan could be skipped.
+     - This is faster: NELL drops from 240 to a few cycles per node. It is also a bigger
+       change to MEGA's datapath.
+     - Not chosen. It would make our MEGA ~50× faster than SGCN on NELL, against the paper's
+       2.6×, and it departs further from the described hardware.
+- **Consequence:** option 1 is consistent hardware. MEGA pays the bitmap scan on chip, and
+  DRAM carries the compact list. It still adds one unit the paper does not show. For a strict
+  MEGA-as-described baseline, use `--x0-format bitmap`. The cost is NELL's 480 MB, which the
+  paper's own numbers contradict.
+  - Why keep the scan time: it is the conservative choice for MEGA (see option 2).
 - **Why this format.** It is the input-layer format SGCN uses for one-hot inputs, so both
   designs read X⁽⁰⁾ alike. It changes nothing where bitmaps are smaller (PubMed,
   Amazon-Ratings). It is the smallest change that removes the inconsistency. Fidelity rule:
@@ -310,7 +330,7 @@ the smaller of two formats, chosen once per layer (`HW.x0_format = "auto"`, defa
 
   | | Cora | CiteSeer | PubMed | NELL |
   |---|---|---|---|---|
-  | DRAM (MB), before → after | 1.70 → 1.33 | 5.03 → 3.75 | 7.20 → 7.20 | 556.3 → 76.1 |
+  | DRAM (MB), before → after | 1.70 → 1.33 | 5.03 → 3.76 | 7.20 → 7.20 | 556.3 → 76.2 |
   | time | unchanged | unchanged | unchanged | unchanged |
 
 - `--x0-format bitmap` restores the M3 accounting (`runs/hw/megasim_m3_bitmap.json`).

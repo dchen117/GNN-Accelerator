@@ -209,12 +209,14 @@ def bitmap_lines(x: SparseRows, ptr: np.ndarray, hw: HW) -> tuple[np.ndarray, np
 
 
 def index_lines(x: SparseRows, ptr: np.ndarray, hw: HW) -> tuple[np.ndarray, np.ndarray]:
-    """X̄⁽⁰⁾ non-zero positions as one 16-bit column index per non-zero, contiguous in node
-    order (the CSR column array; the per-node counts are the bitmap popcounts the Decoder
-    already needs, S-15)."""
+    """X̄⁽⁰⁾ non-zero positions as CSR-style index lists (S-15): per node, a 16-bit non-zero
+    count followed by one 16-bit column index per non-zero, contiguous in node order.
+    The count replaces the bitmap popcount the Decoder uses to find where a node's values
+    end in the package stream (Q-19), since the bitmap itself is no longer in DRAM."""
     assert x.F <= 1 << 16, "16-bit column indices need F ≤ 65,536"
-    nbits = seg_sum(x.nnz_per_row, ptr).astype(np.int64) * 16
-    start = x.ptr[ptr[:-1]] * 16
+    words = seg_sum(x.nnz_per_row, ptr).astype(np.int64) + np.diff(ptr)   # indices + counts
+    start = (x.ptr[ptr[:-1]] + ptr[:-1]) * 16
+    nbits = words * 16
     return lines_touched(start, nbits, hw.line * 8), nbits
 
 
