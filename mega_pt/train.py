@@ -356,7 +356,10 @@ def main(argv=None):
     summary = {}
     for k, v in per_seed[0].items():
         if isinstance(v, (int, float)) and not isinstance(v, bool) and k != "seed":
-            vals = [r[k] for r in per_seed]
+            # NaN = not measured (fp32_seconds of a cached FP32 model); summarize the rest
+            vals = [r[k] for r in per_seed if r[k] == r[k]]
+            if not vals:
+                continue
             summary[k] = {"mean": statistics.fmean(vals),
                           "std": statistics.stdev(vals) if len(vals) > 1 else 0.0}
     with open(os.path.join(out_dir, "results.json"), "w") as f:
