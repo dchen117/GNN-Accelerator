@@ -80,7 +80,7 @@ def load_workload(run_dir: str, seed: int = 0) -> Workload:
     dims = [g.num_features] + [args["hidden"]] * (args.get("layers", 2) - 1) + [g.num_classes]
     model = QGCN(dims, int(g.deg.max()), norm=args["norm"], frac_bits=args["frac_bits"],
                  dropout=args["dropout"], x_param=args["x_param"],
-                 residual=args.get("residual", False))
+                 residual=args.get("residual", False), res_form=args.get("res_form", "pre"))
     ck = torch.load(_fp32_checkpoint(args, seed), weights_only=False)   # our own file
     model.load_state_dict(ck["model"])
     model.eval()                                   # quantize=False: plain FP32 forward
@@ -88,10 +88,13 @@ def load_workload(run_dir: str, seed: int = 0) -> Workload:
     x, hidden = g.x, []
     for l, W in enumerate(model.weights):
         h = torch.sparse.mm(ops.a_norm, x @ W if not x.is_sparse else torch.sparse.mm(x, W))
-        if l in model.residual_layers:     # identity residual (Q-36 / G-08), FP32
-            h = h + x
+        res = x if l in model.residual_layers else None   # identity residual (Q-36 / G-08), FP32
+        if res is not None and model.res_form == "pre":
+            h = h + res
         if l < len(model.weights) - 1:
             h = torch.relu(h)
+        if res is not None and model.res_form == "post":
+            h = h + res
             hidden.append(h.numpy().astype(np.float32))
         x = h
     acc = float((x.argmax(1)[g.test_idx] == g.y[g.test_idx]).float().mean())

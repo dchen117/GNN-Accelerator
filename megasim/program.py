@@ -134,6 +134,7 @@ class Layer:
     enc: FixedTable | None        # (K,) e_d, None on the last layer
     out_bits_table: np.ndarray | None = None   # (K,) bitwidth of the NEXT layer's input (Encoder qmax)
     res: FixedTable | None = None # (K,) r_d = Δ^l_d / Δ^(l+1)_d on residual layers (Q-36), else None
+    res_post: bool = False        # residual added after the ReLU (QGCN res_form "post")
 
     @property
     def last(self) -> bool:
@@ -207,7 +208,8 @@ def load_program(run_dir: str, seed: int = 0) -> tuple[Program, tuple]:
             F_in=model.dims[l], F_out=model.dims[l + 1], W=Wbar,
             bits=bits_all[deg_idx], deg_idx=deg_idx, deg_values=deg_values, bits_table=bits_all,
             alpha_p=FixedTable.from_values(alpha * s_tab), c=FixedTable.from_values(beta / gamma),
-            gamma=FixedTable.from_values(gamma), enc=enc, out_bits_table=out_bits, res=res))
+            gamma=FixedTable.from_values(gamma), enc=enc, out_bits_table=out_bits, res=res,
+            res_post=res is not None and getattr(model, "res_form", "pre") == "post"))
     prog = Program(name=run_dir.rstrip("/").split("/")[-1], model=args.model, graph=graph,
                    x0=x0, layers=layers, y=_np(g.y), test_idx=_np(g.test_idx))
     return prog, (model, g, ops)

@@ -98,6 +98,8 @@ def parse_args(argv=None):
     p.add_argument("--residual", action="store_true",
                    help="identity residual X^(l+1) = ReLU(ÃX̄W̄ + X̄) on hidden→hidden layers "
                         "(ours, Q-36; needs --layers ≥ 3)")
+    p.add_argument("--res-form", default="pre", choices=["pre", "post"],
+                   help="residual added before (ReLU(AXW + X)) or after (ReLU(AXW) + X) the ReLU")
     p.add_argument("--dropout", type=float, default=0.5)
     p.add_argument("--lr", type=float, default=0.01, help="weights, FP32 pretraining")
     # QAT learning rates. Tuned on Cora seed 0-1 (no memory penalty), see mega_pt/README.md:
@@ -142,7 +144,7 @@ def train_fp32(model, g, ops, args, train_ops):
     ops: the evaluation graph; train_ops(): the graph for one training step (a fresh
     neighbor sample for GraphSage, else the same ops)."""
     opt = torch.optim.Adam(model.weight_params(), lr=args.lr, weight_decay=args.wd)
-    best_val, best_state = -1.0, None
+    best_val, best_state, best_ep = -1.0, None, -1
     for ep in range(args.epochs_fp32):
         model.train()
         opt.zero_grad()
@@ -153,10 +155,11 @@ def train_fp32(model, g, ops, args, train_ops):
         with torch.no_grad():
             val = accuracy(model(g.x, ops), g.y, g.val_idx)
         if val > best_val:
-            best_val = val
+            best_val, best_ep = val, ep
             best_state = {k: v.clone() for k, v in model.state_dict().items()}
     model.load_state_dict(best_state)
     model.eval()
+    train_fp32.best_epoch = best_ep            # read by main() for the results row
     with torch.no_grad():
         return accuracy(model(g.x, ops), g.y, g.test_idx), best_val
 
@@ -213,7 +216,7 @@ def train_qat(model, g, ops, args, m_target_kb, train_ops):
 
 # Arguments that change FP32 pretraining; the cache key must include all of them.
 FP32_KEYS = ("model", "dataset", "feat_norm", "inductive", "samples", "hidden", "dropout", "lr",
-             "wd", "epochs_fp32", "norm", "frac_bits", "x_param", "layers", "residual")
+             "wd", "epochs_fp32", "norm", "frac_bits", "x_param", "layers", "residual", "res_form")
 
 
 def _fp32_cache_path(args, seed: int):
@@ -223,8 +226,10 @@ def _fp32_cache_path(args, seed: int):
     # before those options existed keep their names
     # (getattr defaults: sgcnsim calls this with the args of runs made before those options)
     layers, residual = getattr(args, "layers", 2), getattr(args, "residual", False)
-    key = "_".join(f"{k}={getattr(args, k)}" for k in FP32_KEYS
-                   if not (k == "layers" and layers == 2) and not (k == "residual" and not residual))
+    res_form = getattr(args, "res_form", "pre")
+    key = "_".join(f"{k}={getattr(args, k, None)}" for k in FP32_KEYS
+                   if not (k == "layers" and layers == 2) and not (k == "residual" and not residual)
+                   and not (k == "res_form" and (res_form == "pre" or not residual)))
     import hashlib
     return os.path.join(args.fp32_cache, f"{args.model}_{args.dataset}_s{seed}_"
                         f"{hashlib.sha1(key.encode()).hexdigest()[:10]}.pt")
@@ -264,7 +269,7 @@ def main(argv=None):
 
     name = args.run_name or (("" if args.model == "gcn" else f"{args.model}_") + f"{args.dataset}_{args.norm}"
                              + (f"_f{args.frac_bits}" if args.norm == "per_source" else "")
-                             + (f"_L{args.layers}" if args.layers != 2 else "") + ("_res" if args.residual else "")
+                             + (f"_L{args.layers}" if args.layers != 2 else "") + (("_res" + ("post" if args.res_form == "post" else "")) if args.residual else "")
                              + f"_lam{args.lam:g}" + (f"_mt{m_target:.0f}" if args.lam > 0 else ""))
     out_dir = os.path.join(args.out_dir, name)
     os.makedirs(out_dir, exist_ok=True)
@@ -289,7 +294,7 @@ def main(argv=None):
             train_ops = lambda: t_ops
             max_degree = int(g.deg.max())          # ≥ every training-graph degree too
         model = QGCN(dims, max_degree, norm=args.norm, frac_bits=args.frac_bits, dropout=args.dropout,
-                     x_param=args.x_param, residual=args.residual)
+                     x_param=args.x_param, residual=args.residual, res_form=args.res_form)
         cache = _fp32_cache_path(args, seed)
         if cache and os.path.exists(cache):
             ck = torch.load(cache, weights_only=False)        # our own file (see _fp32_cache_path)
@@ -298,15 +303,23 @@ def main(argv=None):
             if sampled:
                 train_gen.set_state(ck["train_gen"])
             fp32_test, fp32_val = ck["fp32_test"], ck["fp32_val"]
+            # older caches lack these; NaN marks "not measured" (the FP32 phase was skipped)
+            fp32_seconds, fp32_best_epoch = ck.get("fp32_seconds", float("nan")), ck.get("fp32_best_epoch", -1)
             print(f"  FP32 model loaded from {cache}")
         else:
+            t_fp32 = time.time()
             fp32_test, fp32_val = train_fp32(model, g, ops, args, train_ops)
+            fp32_seconds, fp32_best_epoch = round(time.time() - t_fp32, 1), train_fp32.best_epoch
             if cache:
                 os.makedirs(os.path.dirname(cache), exist_ok=True)
                 torch.save({"model": model.state_dict(), "rng": torch.get_rng_state(),
                             "train_gen": train_gen.get_state() if sampled else None,
-                            "fp32_test": fp32_test, "fp32_val": fp32_val}, cache)
-        row = {"seed": seed, "fp32_test": fp32_test, "fp32_val": fp32_val}
+                            "fp32_test": fp32_test, "fp32_val": fp32_val,
+                            "fp32_seconds": fp32_seconds, "fp32_best_epoch": fp32_best_epoch}, cache)
+        # Phase timings (2026-11-25): wall seconds of the FP32 and QAT phases and the epoch the
+        # FP32 best-val model came from (a late best epoch = still improving at --epochs-fp32).
+        row = {"seed": seed, "fp32_test": fp32_test, "fp32_val": fp32_val,
+               "fp32_seconds": fp32_seconds, "fp32_best_epoch": fp32_best_epoch}
         if not args.fp32_only:
             model.calibrate(g.x, ops, args.x_init,
                             [float(v) for v in args.x_init_bits.split(",")] if args.x_init_bits else None,
@@ -316,7 +329,9 @@ def main(argv=None):
             model.eval()
             with torch.no_grad():
                 row["ptq_test"] = accuracy(model(g.x, ops), g.y, g.test_idx)  # before QAT, for debugging
+            t_qat = time.time()
             train_qat(model, g, ops, args, m_target, train_ops)
+            row["qat_seconds"] = round(time.time() - t_qat, 1)
             model.eval()
             with torch.no_grad():
                 logits = model(g.x, ops)
@@ -336,7 +351,7 @@ def main(argv=None):
         print(f"seed {seed}: " + ", ".join(
             f"{k}={v:.4f}" if isinstance(v, float) else f"{k}={v}" for k, v in row.items()
             if k in ("fp32_test", "ptq_test", "q_test", "avg_bits_sparse", "avg_bits_dense_all",
-                     "cr_sparse", "seconds") or "psum_max" in k or "lost_topdeg" in k))
+                     "cr_sparse", "seconds", "fp32_seconds", "qat_seconds", "fp32_best_epoch") or "psum_max" in k or "lost_topdeg" in k))
 
     summary = {}
     for k, v in per_seed[0].items():

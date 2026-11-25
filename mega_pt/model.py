@@ -212,12 +212,18 @@ class QGCN(nn.Module):
     before dropout. Residual layers are the hidden → hidden ones: l ≥ 1, l < L−1 and
     F_in = F_out (identity residual, the same rule as SGCN's G-08 except that the logits
     layer never gets one). No new quantizer: X̄^(l) already exists.
+
+    res_form: where the residual is added relative to the ReLU (2026-11-25 study):
+      "pre"  (default)  X^(l+1) = ReLU(Ã·X̄W̄ + X_q)   — the residual can cancel negative aggregates
+      "post"            X^(l+1) = ReLU(Ã·X̄W̄) + X_q   — the classic ResNet/GCN "add after activation"
+    Both cost the same in the Encoder (one multiply-add per value; only the ReLU moves).
     """
 
     def __init__(self, dims: list[int], max_degree: int, norm: str = "fp32",
                  frac_bits: int = 8, dropout: float = 0.5, x_param: str = "alpha",
-                 residual: bool = False):
+                 residual: bool = False, res_form: str = "pre"):
         super().__init__()
+        assert res_form in ("pre", "post"), res_form
         assert norm in NORM_MODES, norm
         self.dims, self.norm, self.frac_bits, self.dropout = dims, norm, frac_bits, dropout
         self.quantize = False
@@ -228,6 +234,7 @@ class QGCN(nn.Module):
         L = len(dims) - 1
         self.residual = residual
         self.residual_layers = residual_layers(dims) if residual else []
+        self.res_form = res_form
         self.weights = nn.ParameterList(
             [nn.Parameter(nn.init.xavier_uniform_(torch.empty(dims[l], dims[l + 1]))) for l in range(L)])
         self.x_quant = nn.ModuleList([DegreeAwareQuantizer(max_degree, x_param) for _ in range(L)])
@@ -331,10 +338,12 @@ class QGCN(nn.Module):
             x = _dropout(x, self.dropout, self.training)
             B = _matmul(x, W)                            # combination, Eq.(3)
             x = self._aggregate(B, l, ops, rec)          # aggregation
-            if res is not None:
+            if res is not None and self.res_form == "pre":
                 x = x + res                              # residual, added in the Encoder (Q-36)
             if l < L - 1:
                 x = F.relu(x)                            # Encoder ReLU (not on logits, Q-10)
+            if res is not None and self.res_form == "post":
+                x = x + res                              # residual after the ReLU (res_form post)
             if record:
                 records.append(rec)
         return (x, records) if record else x
@@ -375,8 +384,11 @@ class QGCN(nn.Module):
             B_seen = ops.src_scale.unsqueeze(1) * B if self.norm == "fold" else B
             self.b_quant[l].init_from_tensor(B_seen, wb_init)
             h = torch.sparse.mm(ops.a_norm, B)
-            x = h + x if l in self.residual_layers else h
+            res = x if l in self.residual_layers else None
+            x = h + res if res is not None and self.res_form == "pre" else h
             if l < L - 1:
                 x = F.relu(x)
+            if res is not None and self.res_form == "post":
+                x = x + res
         self.train(was_training)
         self.quantize = was_quant

@@ -187,13 +187,17 @@ def encode_next(psum: np.ndarray, layer: Layer, x_in: SparseRows | None = None) 
     Residual layers (Q-36, ours): X̄' = min(round(ReLU(psum · e_d · γ_j + X̄ · r_d)), qmax_d),
     X̄ = this layer's own (decoded) input. The two products have different binary points;
     the one with fewer fractional bits is shifted left to align them before the add, then
-    ReLU and one rounding. ReLU now acts on the sum, so it moves after the multiply."""
+    ReLU and one rounding. ReLU now acts on the sum, so it moves after the multiply.
+    layer.res_post (res_form "post"): ReLU(psum · e_d · γ_j) + X̄ · r_d, i.e. the ReLU acts on the
+    aggregate product only; X̄ ≥ 0, so the final max(·, 0) is then a no-op."""
     _check_product_fits(np.maximum(psum, 0), layer.enc, layer.gamma)
     num = psum * layer.enc.codes[layer.deg_idx][:, None] * layer.gamma.codes[None, :]
     sh = layer.enc.shift + layer.gamma.shift
     if layer.res is not None:
         assert x_in is not None and x_in.F == psum.shape[1], "residual needs F_in = F_out"
         xr = x_in.to_dense() * layer.res.codes[layer.deg_idx][:, None]
+        if layer.res_post:
+            num = np.maximum(num, 0)      # ReLU before the add; shifts below keep the sign
         d = sh - layer.res.shift
         if d >= 0:
             xr = xr << d

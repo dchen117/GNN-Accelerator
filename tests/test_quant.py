@@ -341,9 +341,10 @@ def test_residual_layers_and_integer_reference():
     g = _toy_graph()
     ops = GraphOps.from_graph(g)
     outs = {}
-    for res in (False, True):
+    for res in (False, "pre", "post"):
         torch.manual_seed(0)
-        m = QGCN([5, 8, 8, 8, 2], int(g.deg.max()), norm="fold", residual=res)
+        m = QGCN([5, 8, 8, 8, 2], int(g.deg.max()), norm="fold", residual=bool(res),
+                 res_form=res or "pre")
         m.calibrate(g.x, ops)
         m.quantize = True
         m.eval()
@@ -354,4 +355,5 @@ def test_residual_layers_and_integer_reference():
         # and, to be stricter, the logits scaled by t_i
         assert torch.allclose(fake.double(), exact * ops.dst_scale.double()[:, None], atol=1e-4)
         outs[res] = fake
-    assert not torch.allclose(outs[False], outs[True])
+    assert not torch.allclose(outs[False], outs["pre"])
+    assert not torch.allclose(outs["pre"], outs["post"])

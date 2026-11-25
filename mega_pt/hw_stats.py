@@ -66,7 +66,8 @@ def load_run(run_dir: str, seed: int = 0):
     else:
         ops = GraphOps.from_graph(g, a.model)
     model = QGCN(ck["dims"], ck["max_degree"], norm=a.norm, frac_bits=a.frac_bits,
-                 dropout=a.dropout, x_param=a.x_param, residual=getattr(a, "residual", False))
+                 dropout=a.dropout, x_param=a.x_param, residual=getattr(a, "residual", False),
+                 res_form=getattr(a, "res_form", "pre"))
     model.load_state_dict(ck["state"])
     model.quantize = True
     model.eval()
@@ -151,6 +152,8 @@ def int_forward(model: QGCN, x, ops: GraphOps, fmt: str | None = None, stats: di
             g_fx = to_fixed(gamma, fmt)
             qmax = qmax_from_bits(q_next.node_bits(deg, rounded=True)).double()
             pre = psum * e[:, None] * g_fx[None, :]
+            if l in model.residual_layers and model.res_form == "post":
+                pre = pre.clamp_min(0)          # ReLU before the residual add (res_form post)
             if l in model.residual_layers:
                 # residual: the layer's own input X̄^(l), moved from step α^l_d to α^{l+1}_d
                 r_d = to_fixed(alpha[deg] / q_next.scale.double()[deg], fmt)
