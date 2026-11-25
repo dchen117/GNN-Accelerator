@@ -612,19 +612,24 @@ test % and sparse avg bits; the 2-layer column is the QAT row of the λ-sweep / 
 | Roman-Empire | yes | 53.84 ± 0.98 | 52.14 ± 1.27 | **49.55 ± 0.62** | 0.90 | |
 | Amazon-Ratings | no | 46.68 ± 0.22 | 46.33 ± 0.19 | **46.73 ± 0.11** | 0.53 | 47.92 |
 | Amazon-Ratings | yes | 47.28 ± 0.33 | 46.81 ± 0.50 | 46.51 ± 0.23 | 0.47 | |
-| Paris | no / yes | running | | | | 24.18 |
+| Paris | no | 33.89 ± 0.11 | 22.23 ± 0.47 | **27.35 ± 0.31** | 0.46 | 24.18 |
+| Paris | yes | 33.44 ± 0.24 | 20.89 ± 1.27 | 26.78 ± 0.16 | 0.48 | |
 
 - **The residual fixes depth.** Plain 4-layer GCN loses to the 2-layer one everywhere, and
   collapses on Roman-Empire (33.7 vs 46.5). With the residual, Roman-Empire's 4-layer model
   beats the 2-layer one (49.6 vs 46.5; FP32 53.8 vs 47.4), and Cora, CiteSeer and PubMed gain
   0.8–1.9 points over plain 4-layer. Amazon-Ratings is a wash (−0.2, about 1σ).
+- **Paris (long range) gains from depth itself, not from the residual:** plain 4-layer FP32
+  33.9 vs 2-layer 27.0, QAT 27.4 vs 24.2. Four hops reach further; the residual adds nothing
+  (−0.6). Its QAT drop is the largest (FP32 → QAT −6.5; PTQ −11.7): every input sits at the
+  2-bit dense floor (`avg_bits_dense_all` 2.00), the same gap as the 2-layer Paris runs.
 - **QAT costs more at depth on CiteSeer and Roman-Empire:** FP32 → QAT drops 7.6 and 4.3
   points with the residual (2-layer: under 1). The memory penalty is set for 2 layers; we kept
   the recipe on purpose (decision 6), so this is a known gap, not tuned.
-- **Bit-exact:** `python -m megasim.check` passes on seed 0 of all five finished residual runs
+- **Bit-exact:** `python -m megasim.check` passes on seed 0 of all six residual runs
   and on plain Cora (integer reference = functional model). The integer reference's accuracy
   differs from fake-quant q_test by ≤ 0.05 points (Roman-Empire 48.89 vs 48.87, Amazon-Ratings
-  46.25 vs 46.30). The integer reference uses 16-bit fixed-point scale tables, fake-quant uses
+  46.25 vs 46.30, Paris 26.85 vs 26.84). The integer reference uses 16-bit fixed-point scale tables, fake-quant uses
   float factors; a handful of borderline nodes flip.
 
 ## Known limitations / next steps

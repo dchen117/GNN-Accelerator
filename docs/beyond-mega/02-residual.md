@@ -1,6 +1,6 @@
 # 02 — Residual connections on MEGA (ours)
 
-**Status (2026-11-25):** R1 (model + integer reference) and R2 (megasim functional model) implemented. R1 runs done except City-Networks Paris (running). R3–R4 planned.
+**Status (2026-11-25):** R1 (model + integer reference) and R2 (megasim functional model) implemented. R1 done. R3–R4 planned.
 Pointer entry: `docs/mega-kb/04-open-questions.md` Q-36.
 
 ## Scope and rules (user, 2026-11-25)
@@ -130,13 +130,16 @@ std: `mega_pt/README.md` results log, 2026-11-25. Runs: `runs/res4/`.
 | PubMed | 78.97 | 77.70 (75.83) @ 0.82 | **78.47** (76.33) @ 0.86 |
 | Roman-Empire | 46.53 | 33.69 (32.94) @ 0.84 | **49.55** (53.84) @ 0.90 |
 | Amazon-Ratings | 47.92 | **46.73** (46.68) @ 0.53 | 46.51 (47.28) @ 0.47 |
-| City-Networks Paris | 24.18 | running | running |
+| City-Networks Paris | 24.18 | **27.35** (33.89) @ 0.46 | 26.78 (33.44) @ 0.48 |
 
 - The residual is what makes 4 layers trainable. Roman-Empire, heterophilic, is the clear win:
   the 4-layer residual model beats the 2-layer one. On MEGA's citation graphs depth does not
   pay even with the residual: the 2-layer model stays best, which is the usual result for them.
-- Quantization drops more at depth on CiteSeer (7.6 points) and Roman-Empire (4.3), with the
+- Paris (long range) gains from depth itself (+3.2 points over 2 layers, plain); the residual
+  adds nothing there (−0.6). Its quantization gap is the largest (FP32 → QAT −6.5), as at 2
+  layers: every input sits at the 2-bit dense floor.
+- Quantization drops more at depth on CiteSeer (7.6 points), Paris (6.5) and Roman-Empire (4.3), with the
   recipe unchanged (decision 6). Tuning λ for 4 layers is possible later; it does not affect
   the hardware work.
-- `megasim.check` is bit-exact on seed 0 of every finished residual model, so R3 runs on real
+- `megasim.check` is bit-exact on seed 0 of all six residual models, so R3 runs on real
   4-layer models.
