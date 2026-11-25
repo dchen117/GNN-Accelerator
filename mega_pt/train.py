@@ -221,8 +221,10 @@ def _fp32_cache_path(args, seed: int):
         return None
     # layers/residual are left out of the key at their defaults, so 2-layer caches made
     # before those options existed keep their names
+    # (getattr defaults: sgcnsim calls this with the args of runs made before those options)
+    layers, residual = getattr(args, "layers", 2), getattr(args, "residual", False)
     key = "_".join(f"{k}={getattr(args, k)}" for k in FP32_KEYS
-                   if not (k == "layers" and args.layers == 2) and not (k == "residual" and not args.residual))
+                   if not (k == "layers" and layers == 2) and not (k == "residual" and not residual))
     import hashlib
     return os.path.join(args.fp32_cache, f"{args.model}_{args.dataset}_s{seed}_"
                         f"{hashlib.sha1(key.encode()).hexdigest()[:10]}.pt")

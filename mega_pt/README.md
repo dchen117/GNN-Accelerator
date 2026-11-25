@@ -106,10 +106,11 @@ Debug ablation, quantizing only some tensors (here: only the degree-aware featur
 
 Deeper models and residual connections (ours, not MEGA; `docs/beyond-mega/02-residual.md`).
 `--layers 4` gives F → 128 → 128 → 128 → C. `--residual` adds the identity residual on the
-hidden → hidden layers (here layers 1 and 2), using the layer's quantized input:
+hidden → hidden layers (here layers 1 and 2), using the layer's quantized input.
+`--fp32-cache` is needed if SGCN will run the model: sgcnsim simulates the FP32 network:
 
 ```bash
-.venv/bin/python -m mega_pt.train --dataset roman-empire --layers 4 --residual --lam 1e-7 --target-dense-bits 2.0 --seeds 3 --save-model --out-dir runs/res4
+.venv/bin/python -m mega_pt.train --dataset roman-empire --layers 4 --residual --lam 1e-7 --target-dense-bits 2.0 --seeds 3 --save-model --out-dir runs/res4 --fp32-cache runs/res4/fp32_cache
 ```
 
 All options:

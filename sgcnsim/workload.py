@@ -8,7 +8,7 @@ eval mode and keep what the hardware needs:
     graph       CSR by destination (A+I, rows = destinations, edge values Ã)
     x0          CSR of the input features X⁽⁰⁾ (values only matter for sparsity)
     hidden      per hidden layer l ≥ 1: the ReLU output X⁽ˡ⁾ (dense float32) → its zero pattern
-    dims        [F0, hidden, ..., classes]
+    dims        [F0, hidden, ..., classes]   (args.layers deep; residual runs add + X⁽ˡ⁾)
 
     w = load_workload("runs/hw/gcn_cora")
 """
@@ -49,12 +49,15 @@ class Workload:
 
 
 def _fp32_checkpoint(args: dict, seed: int) -> str:
-    """The FP32 pretraining cache file of the run (key hash computed by train.py)."""
-    pat = os.path.join(args["fp32_cache"], f"{args['model']}_{args['dataset']}_s{seed}_*.pt")
-    hits = glob.glob(pat)
-    if len(hits) != 1:
-        raise FileNotFoundError(f"need exactly one FP32 checkpoint matching {pat}, found {hits}")
-    return hits[0]
+    """The FP32 pretraining cache file of the run: the exact name train.py wrote, recomputed
+    from the run's args (a glob on model/dataset/seed is ambiguous once 2-layer, 4-layer and
+    residual caches share a directory)."""
+    from types import SimpleNamespace
+    from mega_pt.train import _fp32_cache_path
+    path = _fp32_cache_path(SimpleNamespace(**args), seed)
+    if path is None or not os.path.exists(path):
+        raise FileNotFoundError(f"FP32 checkpoint {path} not found (train with --fp32-cache)")
+    return path
 
 
 def _to_csr(x: torch.Tensor) -> sp.csr_matrix:
@@ -74,9 +77,10 @@ def load_workload(run_dir: str, seed: int = 0) -> Workload:
         raise ValueError(f"sgcnsim supports GCN runs, got {args['model']}")
     g = load_dataset(args["dataset"], feat_norm=args["feat_norm"]).use_split(seed)
     ops = GraphOps.from_graph(g, "gcn")
-    dims = [g.num_features, args["hidden"], g.num_classes]
+    dims = [g.num_features] + [args["hidden"]] * (args.get("layers", 2) - 1) + [g.num_classes]
     model = QGCN(dims, int(g.deg.max()), norm=args["norm"], frac_bits=args["frac_bits"],
-                 dropout=args["dropout"], x_param=args["x_param"])
+                 dropout=args["dropout"], x_param=args["x_param"],
+                 residual=args.get("residual", False))
     ck = torch.load(_fp32_checkpoint(args, seed), weights_only=False)   # our own file
     model.load_state_dict(ck["model"])
     model.eval()                                   # quantize=False: plain FP32 forward
@@ -84,6 +88,8 @@ def load_workload(run_dir: str, seed: int = 0) -> Workload:
     x, hidden = g.x, []
     for l, W in enumerate(model.weights):
         h = torch.sparse.mm(ops.a_norm, x @ W if not x.is_sparse else torch.sparse.mm(x, W))
+        if l in model.residual_layers:     # identity residual (Q-36 / G-08), FP32
+            h = h + x
         if l < len(model.weights) - 1:
             h = torch.relu(h)
             hidden.append(h.numpy().astype(np.float32))
