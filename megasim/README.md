@@ -80,6 +80,7 @@ A run directory needs `model_seed<s>.pt`, written by `python -m mega_pt.train ..
 | `cacti.py`, `cacti_28nm.json` | CACTI 7.0 runs per buffer at 28 nm (organization calibrated to Tab.IV area) and their cached results | S-14 |
 | `energy.py` | DRAM (7 pJ/bit), SRAM (CACTI per access), PU (Tab.IV power × busy cycles), leakage | S-14 |
 | `ablation.py` | Fig.19(b) DRAM steps rebuilt from the M3 streams under several accountings (diagnostic) | S-15 |
+| `lifetime.py` | How long a subgraph's X̄⁽¹⁾ would have to stay on chip for a residual (diagnostic; residual models are not simulated yet) | Q-36 |
 | `report.py` | Fig.14/16/17/18-style table from a `sim.py --json` file, optionally as ratios to another design | — |
 | `sim.py` | CLI: export → partition → relabel → functional → timing (Ramulator or M2 DRAM) → energy, per run | — |
 | `synthetic.py` | Random but consistent programs, for tests and debugging without trained runs | — |

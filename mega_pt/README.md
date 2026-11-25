@@ -104,6 +104,14 @@ Debug ablation, quantizing only some tensors (here: only the degree-aware featur
 .venv/bin/python -m mega_pt.train --dataset pubmed --norm fold --lam 0 --seeds 3 --quant-parts x
 ```
 
+Deeper models and residual connections (ours, not MEGA; `docs/beyond-mega/02-residual.md`).
+`--layers 4` gives F → 128 → 128 → 128 → C. `--residual` adds the identity residual on the
+hidden → hidden layers (here layers 1 and 2), using the layer's quantized input:
+
+```bash
+.venv/bin/python -m mega_pt.train --dataset roman-empire --layers 4 --residual --lam 1e-7 --target-dense-bits 2.0 --seeds 3 --save-model --out-dir runs/res4
+```
+
 All options:
 
 ```bash
@@ -133,7 +141,7 @@ Outputs go to `runs/<name>/`:
 |---|---|
 | `data.py` | Planetoid loader (Cora/CiteSeer/PubMed/NELL) with a whitelist unpickler. Public split, self-loops, in-degree (Q-01, Q-14). NELL's X^(0) is sparse. Reddit and the extra datasets: sha256-pinned downloads, vectorized edge building (edges grouped by destination), per-column z-score, multiple splits, train-induced subgraph |
 | `quant.py` | Eq.(2) quantizer with STE, the degree-indexed (α, b) table, 4-bit column quantizer, Q1.f fixed point |
-| `model.py` | `QGCN` (the Eq.(1) layer for all three models) and `GraphOps` (Ã per model, GraphSage neighbor sampling, Q-12). The three normalization modes (Q-11) are described in the module docstring |
+| `model.py` | `QGCN` (the Eq.(1) layer for all three models) and `GraphOps` (Ã per model, GraphSage neighbor sampling, Q-12). The three normalization modes (Q-11) are described in the module docstring. Optional identity residual on hidden → hidden layers (`residual_layers`, Q-36) |
 | `metrics.py` | Accuracy, average-bits definitions (Q-15), memory, partial-sum / lost-B checks |
 | `train.py` | CLI: pretraining → calibration → QAT, multiple seeds, results JSON |
 | `ptq_frontier.py` | Debug: PTQ accuracy vs fixed per-layer bitwidth (no QAT), MSE clip per b |

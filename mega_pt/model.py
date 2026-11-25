@@ -191,6 +191,12 @@ class GraphOps:
         return cls.build(src, dst, g.num_nodes, model)
 
 
+def residual_layers(dims: list[int]) -> list[int]:
+    """Layers that get the identity residual (Q-36): hidden → hidden with F_in = F_out."""
+    L = len(dims) - 1
+    return [l for l in range(1, L - 1) if dims[l] == dims[l + 1]]
+
+
 class QGCN(nn.Module):
     """Eq.(1) GNN, no bias (Q-08): GCN, GIN-0 or GraphSage-mean depending on the GraphOps passed
     in (the layer itself is identical, Q-12). `quantize=False` gives the plain FP32 model used
@@ -199,10 +205,18 @@ class QGCN(nn.Module):
     dims = [F, hidden, ..., classes]. The input x may be dense or sparse COO (NELL);
     hidden activations are always dense. Layer l has a DegreeAwareQuantizer for its input
     (Q-03, Q-10: including X^(0)), a weight quantizer and a B quantizer.
+
+    residual=True (ours, not in MEGA; docs/mega-kb/04-open-questions.md Q-36): every layer in
+    `residual_layers` computes X^(l+1) = ReLU(Ã·X̄^(l)W̄ + X^(l)_q), where X^(l)_q is the
+    layer's QUANTIZED input (the X̄ the hardware stores, times its per-degree step), taken
+    before dropout. Residual layers are the hidden → hidden ones: l ≥ 1, l < L−1 and
+    F_in = F_out (identity residual, the same rule as SGCN's G-08 except that the logits
+    layer never gets one). No new quantizer: X̄^(l) already exists.
     """
 
     def __init__(self, dims: list[int], max_degree: int, norm: str = "fp32",
-                 frac_bits: int = 8, dropout: float = 0.5, x_param: str = "alpha"):
+                 frac_bits: int = 8, dropout: float = 0.5, x_param: str = "alpha",
+                 residual: bool = False):
         super().__init__()
         assert norm in NORM_MODES, norm
         self.dims, self.norm, self.frac_bits, self.dropout = dims, norm, frac_bits, dropout
@@ -212,6 +226,8 @@ class QGCN(nn.Module):
         # through in float; its integer version is still computed for the metrics.
         self.quant_parts = "xwb"
         L = len(dims) - 1
+        self.residual = residual
+        self.residual_layers = residual_layers(dims) if residual else []
         self.weights = nn.ParameterList(
             [nn.Parameter(nn.init.xavier_uniform_(torch.empty(dims[l], dims[l + 1]))) for l in range(L)])
         self.x_quant = nn.ModuleList([DegreeAwareQuantizer(max_degree, x_param) for _ in range(L)])
@@ -308,12 +324,15 @@ class QGCN(nn.Module):
                     rec["node_bits"] = self.x_quant[l].node_bits(ops.deg, rounded=True).detach()
             else:
                 W = self.weights[l]
+            res = x if l in self.residual_layers else None   # quantized input, pre-dropout
             # Dropout AFTER the quantizer: the quantizer then sees the same value
             # distribution in training and eval (dropout's 1/(1-p) rescale would otherwise
             # bias the learned α). Our choice; the paper doesn't say.
             x = _dropout(x, self.dropout, self.training)
             B = _matmul(x, W)                            # combination, Eq.(3)
             x = self._aggregate(B, l, ops, rec)          # aggregation
+            if res is not None:
+                x = x + res                              # residual, added in the Encoder (Q-36)
             if l < L - 1:
                 x = F.relu(x)                            # Encoder ReLU (not on logits, Q-10)
             if record:
@@ -355,7 +374,8 @@ class QGCN(nn.Module):
             B = _matmul(x, self.weights[l])
             B_seen = ops.src_scale.unsqueeze(1) * B if self.norm == "fold" else B
             self.b_quant[l].init_from_tensor(B_seen, wb_init)
-            x = torch.sparse.mm(ops.a_norm, B)
+            h = torch.sparse.mm(ops.a_norm, B)
+            x = h + x if l in self.residual_layers else h
             if l < L - 1:
                 x = F.relu(x)
         self.train(was_training)

@@ -14,6 +14,8 @@ The run dir must hold model_seed<s>.pt (train.py --save-model). This script:
      Encoder requantization (Q-26): X̄' = clip(round(ReLU(psum) · e_{d_i} · γ_j), 0..qmax_{d_i})
          psum = (A+I) B̄ (integer AU sums), e_d = t_d / α^{l+1}_d (GCN t_d = d^-1/2,
          GraphSage 1/d, GIN 1), γ_j the B scale of this layer
+     Residual layers (ours, Q-36): X̄' = clip(round(ReLU(psum · e_d · γ_j + X̄ · r_d)), 0..qmax_d)
+         X̄ = this layer's own input, r_d = α^l_d / α^{l+1}_d (step ratio, per degree)
    With exact (float64) factors it must match the fake-quant model's predictions (checked
    and printed as `int_vs_fake_agree`). Then each factor is rounded to a fixed-point format
    to measure what the hardware scale format costs (Q-16):
@@ -64,7 +66,7 @@ def load_run(run_dir: str, seed: int = 0):
     else:
         ops = GraphOps.from_graph(g, a.model)
     model = QGCN(ck["dims"], ck["max_degree"], norm=a.norm, frac_bits=a.frac_bits,
-                 dropout=a.dropout, x_param=a.x_param)
+                 dropout=a.dropout, x_param=a.x_param, residual=getattr(a, "residual", False))
     model.load_state_dict(ck["state"])
     model.quantize = True
     model.eval()
@@ -107,6 +109,10 @@ def _xbar_coo(xbar: torch.Tensor):
     return r[keep], c[keep], v[keep].double()
 
 
+def _dense(xbar: torch.Tensor) -> torch.Tensor:
+    return (xbar.to_dense() if xbar.is_sparse else xbar).double()
+
+
 def _matmul_int(r, c, v, Wbar, n):
     out = torch.zeros(n, Wbar.shape[1], dtype=torch.float64)
     step = max(1, 4_000_000 // Wbar.shape[1])          # chunk: Reddit has 1.4e8 non-zeros
@@ -144,8 +150,14 @@ def int_forward(model: QGCN, x, ops: GraphOps, fmt: str | None = None, stats: di
             e = to_fixed(t / q_next.scale.double()[deg], fmt)
             g_fx = to_fixed(gamma, fmt)
             qmax = qmax_from_bits(q_next.node_bits(deg, rounded=True)).double()
-            xbar = torch.minimum(round_half_away(psum.clamp_min(0) * e[:, None] * g_fx[None, :]),
-                                 qmax[:, None])
+            pre = psum * e[:, None] * g_fx[None, :]
+            if l in model.residual_layers:
+                # residual: the layer's own input X̄^(l), moved from step α^l_d to α^{l+1}_d
+                r_d = to_fixed(alpha[deg] / q_next.scale.double()[deg], fmt)
+                pre = pre + _dense(xbar) * r_d[:, None]
+                if stats is not None:
+                    stats[l]["tables"]["res_deg"] = alpha[deg] / q_next.scale.double()[deg]
+            xbar = torch.minimum(round_half_away(pre.clamp_min(0)), qmax[:, None])
             if stats is not None:
                 stats[l]["tables"]["enc_deg"] = t / q_next.scale.double()[deg]
         else:

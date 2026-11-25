@@ -327,3 +327,31 @@ def test_floyd_sampler_matches_degrees_and_is_uniform():
         assert sel.unique().numel() == k
         hits[sel] += 1
     assert (hits / R - k / 40).abs().max() < 0.03          # ~5σ for R = 3000
+
+
+def test_residual_layers_and_integer_reference():
+    """Q-36: the identity residual goes on hidden → hidden layers only, changes the output,
+    and the integer reference (hw_stats.int_forward, Encoder + X̄·r_d) agrees with the
+    fake-quant model exactly."""
+    from mega_pt.hw_stats import int_forward
+    from mega_pt.model import residual_layers
+    assert residual_layers([5, 8, 8, 8, 2]) == [1, 2]
+    assert residual_layers([5, 8, 2]) == [] and residual_layers([8, 8, 8]) == []   # logits: never
+    assert residual_layers([5, 8, 6, 6, 2]) == [2]          # F_in ≠ F_out: no residual
+    g = _toy_graph()
+    ops = GraphOps.from_graph(g)
+    outs = {}
+    for res in (False, True):
+        torch.manual_seed(0)
+        m = QGCN([5, 8, 8, 8, 2], int(g.deg.max()), norm="fold", residual=res)
+        m.calibrate(g.x, ops)
+        m.quantize = True
+        m.eval()
+        with torch.no_grad():
+            fake = m(g.x, ops)
+            exact = int_forward(m, g.x, ops)
+        # int_forward drops the per-row t_i on the logits (argmax-invariant): compare argmax
+        # and, to be stricter, the logits scaled by t_i
+        assert torch.allclose(fake.double(), exact * ops.dst_scale.double()[:, None], atol=1e-4)
+        outs[res] = fake
+    assert not torch.allclose(outs[False], outs[True])

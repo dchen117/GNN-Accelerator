@@ -748,6 +748,16 @@ should say which kind it is: filling a gap, or departing from a stated detail.
       between blocks.
     - Node blocks: the same as the row cache, only coarser.
 
+### Q-36 — Residual connections `[PT][SIM]` beyond MEGA
+- Says: nothing. MEGA's models are 2-layer, without residuals (Tab.III).
+- Decision: **Ours, user 2026-11-25. This is not the baseline, so the fidelity rule above does
+  not apply.** Full design and results: `docs/beyond-mega/02-residual.md`.
+  - The form is the identity residual X⁽ˡ⁺¹⁾ = ReLU(Ã·X̄⁽ˡ⁾W̄ + X̄⁽ˡ⁾·Δ⁽ˡ⁾) on
+    hidden → hidden layers.
+  - It is added in the Encoder through a per-degree step ratio r_d.
+  - Models are 4-layer GCN.
+  - Every added component (Decoder, tables, buffers, DRAM streams) is counted.
+
 ## E. Evaluation reporting
 
 ### Q-31 — Missing accuracy/bitwidth entries for hardware-evaluated cases `[SIM]` affects-fidelity

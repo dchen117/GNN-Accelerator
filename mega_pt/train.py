@@ -39,7 +39,7 @@ import torch.nn.functional as F
 
 from .data import DATASETS, DEFAULT_FEAT_NORM, load_dataset
 from .metrics import accuracy, quant_report
-from .model import ETA, MODELS, NORM_MODES, GraphOps, QGCN
+from .model import ETA, MODELS, NORM_MODES, GraphOps, QGCN, residual_layers
 
 
 def parse_args(argv=None):
@@ -93,6 +93,11 @@ def parse_args(argv=None):
     p.add_argument("--frac-bits", type=int, default=8, help="f in Q1.f for per_source mode")
     p.add_argument("--hidden", type=int, default=None,
                    help="default from Tab.III: 128 for GCN and GIN, 256 for GraphSage")
+    p.add_argument("--layers", type=int, default=2,
+                   help="GNN layers (Tab.III: 2). dims = [F] + [hidden]*(layers-1) + [classes]")
+    p.add_argument("--residual", action="store_true",
+                   help="identity residual X^(l+1) = ReLU(ÃX̄W̄ + X̄) on hidden→hidden layers "
+                        "(ours, Q-36; needs --layers ≥ 3)")
     p.add_argument("--dropout", type=float, default=0.5)
     p.add_argument("--lr", type=float, default=0.01, help="weights, FP32 pretraining")
     # QAT learning rates. Tuned on Cora seed 0-1 (no memory penalty), see mega_pt/README.md:
@@ -208,13 +213,16 @@ def train_qat(model, g, ops, args, m_target_kb, train_ops):
 
 # Arguments that change FP32 pretraining; the cache key must include all of them.
 FP32_KEYS = ("model", "dataset", "feat_norm", "inductive", "samples", "hidden", "dropout", "lr",
-             "wd", "epochs_fp32", "norm", "frac_bits", "x_param")
+             "wd", "epochs_fp32", "norm", "frac_bits", "x_param", "layers", "residual")
 
 
 def _fp32_cache_path(args, seed: int):
     if not args.fp32_cache:
         return None
-    key = "_".join(f"{k}={getattr(args, k)}" for k in FP32_KEYS)
+    # layers/residual are left out of the key at their defaults, so 2-layer caches made
+    # before those options existed keep their names
+    key = "_".join(f"{k}={getattr(args, k)}" for k in FP32_KEYS
+                   if not (k == "layers" and args.layers == 2) and not (k == "residual" and not args.residual))
     import hashlib
     return os.path.join(args.fp32_cache, f"{args.model}_{args.dataset}_s{seed}_"
                         f"{hashlib.sha1(key.encode()).hexdigest()[:10]}.pt")
@@ -236,7 +244,9 @@ def main(argv=None):
     sampled = args.model == "sage"
     if args.hidden is None:
         args.hidden = 256 if args.model == "sage" else 128          # Tab.III
-    dims = [g.num_features, args.hidden, g.num_classes]
+    dims = [g.num_features] + [args.hidden] * (args.layers - 1) + [g.num_classes]
+    if args.residual:
+        assert residual_layers(dims), f"--residual needs a hidden→hidden layer, dims={dims}"
 
     # M_target (KB). Eq.(4) counts dense storage over each layer input (Q-10, Q-13).
     if args.target_layer_bits is not None:
@@ -252,6 +262,7 @@ def main(argv=None):
 
     name = args.run_name or (("" if args.model == "gcn" else f"{args.model}_") + f"{args.dataset}_{args.norm}"
                              + (f"_f{args.frac_bits}" if args.norm == "per_source" else "")
+                             + (f"_L{args.layers}" if args.layers != 2 else "") + ("_res" if args.residual else "")
                              + f"_lam{args.lam:g}" + (f"_mt{m_target:.0f}" if args.lam > 0 else ""))
     out_dir = os.path.join(args.out_dir, name)
     os.makedirs(out_dir, exist_ok=True)
@@ -276,7 +287,7 @@ def main(argv=None):
             train_ops = lambda: t_ops
             max_degree = int(g.deg.max())          # ≥ every training-graph degree too
         model = QGCN(dims, max_degree, norm=args.norm, frac_bits=args.frac_bits, dropout=args.dropout,
-                     x_param=args.x_param)
+                     x_param=args.x_param, residual=args.residual)
         cache = _fp32_cache_path(args, seed)
         if cache and os.path.exists(cache):
             ck = torch.load(cache, weights_only=False)        # our own file (see _fp32_cache_path)

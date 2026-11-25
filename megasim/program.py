@@ -157,6 +157,9 @@ def load_program(run_dir: str, seed: int = 0) -> tuple[Program, tuple]:
     from mega_pt.hw_stats import load_run              # training-side code, only used here
 
     model, g, ops, args = load_run(run_dir, seed)
+    # Residual models (Q-36) need the Encoder's r_d table and residual reads: not exported
+    # yet (milestone R2). Refuse instead of silently simulating a different network.
+    assert not model.residual_layers, "residual models are not supported by megasim yet (R2)"
     n = g.num_nodes
     deg = _np(ops.deg).astype(np.int64)
     a = ops.a_bin.coalesce()
