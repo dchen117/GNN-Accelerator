@@ -1,6 +1,6 @@
 # 02 — Residual connections on MEGA (ours)
 
-**Status (2026-11-25):** R1 (model + integer reference) and R2 (megasim functional model) implemented. R1 runs in progress. R3–R4 planned.
+**Status (2026-11-25):** R1 (model + integer reference) and R2 (megasim functional model) implemented. R1 runs done except City-Networks Paris (running). R3–R4 planned.
 Pointer entry: `docs/mega-kb/04-open-questions.md` Q-36.
 
 ## Scope and rules (user, 2026-11-25)
@@ -120,4 +120,23 @@ cycles.
 
 ## Results
 
-R1 accuracy tables go here when the runs finish.
+R1, 3 seeds, QAT test % (FP32 in brackets) @ sparse avg bits. Full table with PTQ and
+std: `mega_pt/README.md` results log, 2026-11-25. Runs: `runs/res4/`.
+
+| Dataset | 2-layer | 4-layer plain | 4-layer residual |
+|---|---|---|---|
+| Cora | 81.67 | 78.13 (78.67) @ 1.32 | **79.33** (80.23) @ 1.34 |
+| CiteSeer | 70.35 | 60.70 (66.53) @ 2.14 | **62.60** (70.20) @ 2.55 |
+| PubMed | 78.97 | 77.70 (75.83) @ 0.82 | **78.47** (76.33) @ 0.86 |
+| Roman-Empire | 46.53 | 33.69 (32.94) @ 0.84 | **49.55** (53.84) @ 0.90 |
+| Amazon-Ratings | 47.92 | **46.73** (46.68) @ 0.53 | 46.51 (47.28) @ 0.47 |
+| City-Networks Paris | 24.18 | running | running |
+
+- The residual is what makes 4 layers trainable. Roman-Empire, heterophilic, is the clear win:
+  the 4-layer residual model beats the 2-layer one. On MEGA's citation graphs depth does not
+  pay even with the residual: the 2-layer model stays best, which is the usual result for them.
+- Quantization drops more at depth on CiteSeer (7.6 points) and Roman-Empire (4.3), with the
+  recipe unchanged (decision 6). Tuning λ for 4 layers is possible later; it does not affect
+  the hardware work.
+- `megasim.check` is bit-exact on seed 0 of every finished residual model, so R3 runs on real
+  4-layer models.

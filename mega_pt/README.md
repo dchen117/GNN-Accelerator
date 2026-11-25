@@ -593,6 +593,40 @@ cycles / available.
     per node at 256 bits/cycle (480 with fixed slices) against about 2 compute cycles.
   - NELL's layer 0 is therefore bound entirely by bitmap scanning in MEGA's format (Q-19, Q-23).
 
+### 2026-11-25 — 4-layer GCN ± identity residual (Q-36, R1), 3 seeds
+
+`--layers 4` (F → 128 → 128 → 128 → C), with and without `--residual` (layers 1 and 2), recipe
+unchanged: `--target-dense-bits 2.0`; λ: Cora 1e-5, CiteSeer and PubMed 1e-6, extra datasets 1e-7;
+`--save-model --out-dir runs/res4 --fp32-cache runs/res4/fp32_cache`. Columns: FP32 / PTQ / QAT
+test % and sparse avg bits; the 2-layer column is the QAT row of the λ-sweep / extra-datasets logs.
+
+| Dataset | Residual | FP32 | PTQ | QAT | avg bits | 2-layer QAT |
+|---|---|---|---|---|---|---|
+| Cora | no | 78.67 ± 1.72 | 77.77 ± 1.92 | 78.13 ± 0.47 | 1.32 | 81.67 |
+| Cora | yes | 80.23 ± 0.29 | 79.83 ± 0.61 | **79.33 ± 0.12** | 1.34 | |
+| CiteSeer | no | 66.53 ± 2.02 | 63.63 ± 2.53 | 60.70 ± 2.38 | 2.14 | 70.35 |
+| CiteSeer | yes | 70.20 ± 0.72 | 69.27 ± 1.03 | **62.60 ± 1.44** | 2.55 | |
+| PubMed | no | 75.83 ± 0.70 | 76.13 ± 0.49 | 77.70 ± 0.52 | 0.82 | 78.97 |
+| PubMed | yes | 76.33 ± 1.14 | 76.97 ± 1.66 | **78.47 ± 0.47** | 0.86 | |
+| Roman-Empire | no | 32.94 ± 0.63 | 31.46 ± 0.80 | 33.69 ± 0.17 | 0.84 | 46.53 |
+| Roman-Empire | yes | 53.84 ± 0.98 | 52.14 ± 1.27 | **49.55 ± 0.62** | 0.90 | |
+| Amazon-Ratings | no | 46.68 ± 0.22 | 46.33 ± 0.19 | **46.73 ± 0.11** | 0.53 | 47.92 |
+| Amazon-Ratings | yes | 47.28 ± 0.33 | 46.81 ± 0.50 | 46.51 ± 0.23 | 0.47 | |
+| Paris | no / yes | running | | | | 24.18 |
+
+- **The residual fixes depth.** Plain 4-layer GCN loses to the 2-layer one everywhere, and
+  collapses on Roman-Empire (33.7 vs 46.5). With the residual, Roman-Empire's 4-layer model
+  beats the 2-layer one (49.6 vs 46.5; FP32 53.8 vs 47.4), and Cora, CiteSeer and PubMed gain
+  0.8–1.9 points over plain 4-layer. Amazon-Ratings is a wash (−0.2, about 1σ).
+- **QAT costs more at depth on CiteSeer and Roman-Empire:** FP32 → QAT drops 7.6 and 4.3
+  points with the residual (2-layer: under 1). The memory penalty is set for 2 layers; we kept
+  the recipe on purpose (decision 6), so this is a known gap, not tuned.
+- **Bit-exact:** `python -m megasim.check` passes on seed 0 of all five finished residual runs
+  and on plain Cora (integer reference = functional model). The integer reference's accuracy
+  differs from fake-quant q_test by ≤ 0.05 points (Roman-Empire 48.89 vs 48.87, Amazon-Ratings
+  46.25 vs 46.30). The integer reference uses 16-bit fixed-point scale tables, fake-quant uses
+  float factors; a handful of borderline nodes flip.
+
 ## Known limitations / next steps
 
 - **b convergence:** Adam moves b by about `--lr-bits` per step, so 200 epochs allow about 2 bits
