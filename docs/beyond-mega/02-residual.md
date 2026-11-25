@@ -1,6 +1,6 @@
 # 02 — Residual connections on MEGA (ours)
 
-**Status (2026-11-25):** R1 (model + integer reference) implemented. R2–R4 planned.
+**Status (2026-11-25):** R1 (model + integer reference) and R2 (megasim functional model) implemented. R1 runs in progress. R3–R4 planned.
 Pointer entry: `docs/mega-kb/04-open-questions.md` Q-36.
 
 ## Scope and rules (user, 2026-11-25)
@@ -103,8 +103,15 @@ R3, where the logic cost model gets built anyway.
 
 1. **R1** (done in code; runs in `runs/res4/`): `--layers`, `--residual` in `mega_pt`; the
    integer reference; 4-layer GCN ± residual on the six datasets.
-2. **R2:** megasim export of r_d and the residual add in `functional.py`, bit-exact against
-   `int_forward`. Until then `megasim.program.load_program` refuses residual models.
+2. **R2** (done): `megasim.program` exports r_d (`Layer.res`, 16-bit fixed point like the other
+   tables) and `functional.encode_next` adds X̄ · r_d.
+   - The two products have different binary points: the one with fewer fractional bits is
+     shifted left, then the sum gets ReLU and one rounding.
+   - Bit-exact against `int_forward` (`python -m megasim.check <run>`) on the 4-layer residual
+     Cora smoke model.
+   - With the residual term removed, the check fails from layer 2 on, so it does test the add.
+   - `tests/test_megasim.py::test_encoder_residual_matches_float` covers both shift orderings.
+   - `timing.simulate` refuses residual programs until R3.
 3. **R3:** timing, DRAM streams, buffer checks, the components above, energy and area; then
    the improvements.
 4. **R4:** MEGA vs SGCN (`sgcnsim --residual`) on the same 4-layer models.

@@ -85,3 +85,27 @@ def test_pass_tile_split():
     _, p, tile = functional._pass_tile(x)
     assert np.array_equal(np.bincount(tile[p == 0]), [32, 32, 32, 32])
     assert list(tile[p == 1]) == [0, 1]
+
+
+@pytest.mark.parametrize("res_scale", [0.25, 1e-6])   # r_d with fewer / more fractional bits than e·γ
+def test_encoder_residual_matches_float(res_scale):
+    """Q-36: the Encoder's residual add aligns the two binary points exactly; the result
+    equals min(round_half_away(ReLU(psum·e·γ + x̄·r)), qmax) computed in float64."""
+    from types import SimpleNamespace
+    rng = np.random.default_rng(0)
+    n, F, K = 50, 16, 4
+    deg_idx = rng.integers(0, K, n)
+    enc = FixedTable.from_values(rng.uniform(0.01, 0.2, K))
+    gamma = FixedTable.from_values(rng.uniform(0.05, 1.0, F))
+    res = FixedTable.from_values(rng.uniform(0.5, 1.0, K) * res_scale)
+    out_bits = np.array([2, 4, 6, 8])
+    layer = SimpleNamespace(enc=enc, gamma=gamma, res=res, deg_idx=deg_idx, out_bits_table=out_bits)
+    psum = rng.integers(-200, 200, (n, F))
+    xin = rng.integers(0, 16, (n, F)) * (rng.random((n, F)) < 0.5)
+    got = functional.encode_next(psum, layer, SparseRows.from_dense(xin)).to_dense()
+    pre = (psum * enc.values()[deg_idx][:, None] * gamma.values()[None, :]
+           + xin * res.values()[deg_idx][:, None])
+    pre = np.maximum(pre, 0)
+    want = np.minimum(np.sign(pre) * np.floor(np.abs(pre) + 0.5),
+                      ((1 << (out_bits[deg_idx] - 1)) - 1)[:, None])
+    assert np.array_equal(got, want.astype(np.int64))

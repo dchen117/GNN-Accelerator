@@ -17,6 +17,7 @@ One layer, in hardware order:
   4. Aggregation Units (Q-25)   psum_i = Σ_{j ∈ N(i) ∪ {i}} B̄_j, 16-bit saturating.
   5. Encoder (Q-16/26)          X̄' = min(round(ReLU(psum) · e_d · γ_j), qmax_d), packed into
                                 the next layer's packages. Last layer: logits = psum · γ_j.
+                                Residual layers (Q-36): + X̄ · r_d before ReLU.
 
 The whole graph is processed at once per bit-plane (no cycle loop); the tile/pass split is
 reproduced so every accumulator can be range-checked against the widths of Q-22/Q-25.
@@ -180,12 +181,27 @@ def aggregate(B: np.ndarray, prog: Program) -> tuple[np.ndarray, dict]:
                   "au_may_saturate": int((bound >= lim).sum())}
 
 
-def encode_next(psum: np.ndarray, layer: Layer) -> SparseRows:
-    """Encoder QN units (Q-16/26): ReLU, X̄' = min(round(psum · e_d · γ_j), qmax_d)."""
-    pos = np.maximum(psum, 0)
-    _check_product_fits(pos, layer.enc, layer.gamma)
-    num = pos * layer.enc.codes[layer.deg_idx][:, None] * layer.gamma.codes[None, :]
-    q = round_shift(num, layer.enc.shift + layer.gamma.shift)
+def encode_next(psum: np.ndarray, layer: Layer, x_in: SparseRows | None = None) -> SparseRows:
+    """Encoder QN units (Q-16/26): ReLU, X̄' = min(round(psum · e_d · γ_j), qmax_d).
+
+    Residual layers (Q-36, ours): X̄' = min(round(ReLU(psum · e_d · γ_j + X̄ · r_d)), qmax_d),
+    X̄ = this layer's own (decoded) input. The two products have different binary points;
+    the one with fewer fractional bits is shifted left to align them before the add, then
+    ReLU and one rounding. ReLU now acts on the sum, so it moves after the multiply."""
+    _check_product_fits(np.maximum(psum, 0), layer.enc, layer.gamma)
+    num = psum * layer.enc.codes[layer.deg_idx][:, None] * layer.gamma.codes[None, :]
+    sh = layer.enc.shift + layer.gamma.shift
+    if layer.res is not None:
+        assert x_in is not None and x_in.F == psum.shape[1], "residual needs F_in = F_out"
+        xr = x_in.to_dense() * layer.res.codes[layer.deg_idx][:, None]
+        d = sh - layer.res.shift
+        if d >= 0:
+            xr = xr << d
+        else:
+            num, sh = num << -d, layer.res.shift
+        num = num + xr
+        assert float(np.abs(num).max(initial=0)) < 2.0 ** 53, "residual sum exceeds 2^53"
+    q = round_shift(np.maximum(num, 0), sh)
     qmax = (1 << (layer.out_bits_table[layer.deg_idx] - 1)) - 1
     return SparseRows.from_dense(np.minimum(q, qmax[:, None]))
 
@@ -199,7 +215,7 @@ def run_layer(x: SparseRows, layer: Layer, prog: Program) -> LayerResult:
     if layer.last:
         return LayerResult(acc, B, psum, None, psum * layer.gamma.codes[None, :],
                            layer.gamma.shift, checks, mem)
-    return LayerResult(acc, B, psum, encode_next(psum, layer), None, None, checks, mem)
+    return LayerResult(acc, B, psum, encode_next(psum, layer, x_dec), None, None, checks, mem)
 
 
 def run(prog: Program) -> list[LayerResult]:

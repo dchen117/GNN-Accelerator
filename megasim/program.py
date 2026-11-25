@@ -105,6 +105,11 @@ class SparseRows:
     def nnz_per_row(self) -> np.ndarray:
         return np.diff(self.ptr)
 
+    def to_dense(self) -> np.ndarray:
+        out = np.zeros((self.n, self.F), dtype=np.int64)
+        out[self.rows(), self.col] = self.val
+        return out
+
     def rows(self) -> np.ndarray:
         """Row index of every stored non-zero."""
         return np.repeat(np.arange(self.n), self.nnz_per_row)
@@ -128,6 +133,7 @@ class Layer:
     gamma: FixedTable             # (F_out,) γ_j
     enc: FixedTable | None        # (K,) e_d, None on the last layer
     out_bits_table: np.ndarray | None = None   # (K,) bitwidth of the NEXT layer's input (Encoder qmax)
+    res: FixedTable | None = None # (K,) r_d = Δ^l_d / Δ^(l+1)_d on residual layers (Q-36), else None
 
     @property
     def last(self) -> bool:
@@ -157,9 +163,6 @@ def load_program(run_dir: str, seed: int = 0) -> tuple[Program, tuple]:
     from mega_pt.hw_stats import load_run              # training-side code, only used here
 
     model, g, ops, args = load_run(run_dir, seed)
-    # Residual models (Q-36) need the Encoder's r_d table and residual reads: not exported
-    # yet (milestone R2). Refuse instead of silently simulating a different network.
-    assert not model.residual_layers, "residual models are not supported by megasim yet (R2)"
     n = g.num_nodes
     deg = _np(ops.deg).astype(np.int64)
     a = ops.a_bin.coalesce()
@@ -192,16 +195,19 @@ def load_program(run_dir: str, seed: int = 0) -> tuple[Program, tuple]:
         alpha = _np(q.scale).astype(np.float64)[deg_values]
         beta = _np(model.w_quant[l].scale).astype(np.float64)
         gamma = _np(model.b_quant[l].scale).astype(np.float64)
-        enc = out_bits = None
+        enc = out_bits = res = None
         if l < L - 1:
             qn = model.x_quant[l + 1]
-            enc = FixedTable.from_values(t_tab / _np(qn.scale).astype(np.float64)[deg_values])
+            alpha_next = _np(qn.scale).astype(np.float64)[deg_values]
+            enc = FixedTable.from_values(t_tab / alpha_next)
+            if l in model.residual_layers:       # Encoder residual factor (Q-36)
+                res = FixedTable.from_values(alpha / alpha_next)
             out_bits = _np(qn.node_bits(torch.as_tensor(deg_values), rounded=True)).astype(np.int64)
         layers.append(Layer(
             F_in=model.dims[l], F_out=model.dims[l + 1], W=Wbar,
             bits=bits_all[deg_idx], deg_idx=deg_idx, deg_values=deg_values, bits_table=bits_all,
             alpha_p=FixedTable.from_values(alpha * s_tab), c=FixedTable.from_values(beta / gamma),
-            gamma=FixedTable.from_values(gamma), enc=enc, out_bits_table=out_bits))
+            gamma=FixedTable.from_values(gamma), enc=enc, out_bits_table=out_bits, res=res))
     prog = Program(name=run_dir.rstrip("/").split("/")[-1], model=args.model, graph=graph,
                    x0=x0, layers=layers, y=_np(g.y), test_idx=_np(g.test_idx))
     return prog, (model, g, ops)

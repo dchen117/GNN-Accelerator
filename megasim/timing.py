@@ -494,6 +494,9 @@ def simulate(prog: Program, ptr: np.ndarray, func: list[LayerResult], hw: HW = H
     [ptr[k], ptr[k+1]). `func` is functional.run(prog) (gives each layer's X̄).
     `dram` defaults to the M2 bandwidth server; megasim.dram.ramulator passes a LatencyDram.
     The DRAM object (with its call log) is returned as report.dram."""
+    # Residual layers (Q-36) need the X̄⁽ˡ⁾ round trip, its Decoder and the Encoder add: not
+    # modelled yet (milestone R3). Refuse instead of reporting a residual-free schedule.
+    assert all(l.res is None for l in prog.layers), "residual timing is not modelled yet (R3)"
     g, L, K = prog.graph, len(prog.layers), ptr.size - 1
     n = g.n
     sub = np.repeat(np.arange(K), np.diff(ptr))
