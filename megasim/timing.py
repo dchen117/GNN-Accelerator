@@ -75,6 +75,11 @@ class HW:
     # whole layer. Only the DRAM stream changes: on chip the Decoder still gets (and the
     # combination still scans) the bitmap, so timing and SRAM counts are those of "bitmap".
     x0_format: str = "auto"
+    # Index → bitmap expander (S-15, counted since 2026-11-25): between DRAM and the Input
+    # Buffer when X̄⁽⁰⁾ positions come as indices. Emits one scan-width (256-bit) bitmap word
+    # per cycle and sets up to this many indices per cycle (8 keeps it within 1 % of the
+    # bitmap-scan rate on our datasets; 4 costs up to +23 % on Cora).
+    expander_idx: int = 8
 
     @property
     def region_bytes(self) -> int:       # Sparse Buffer: 16 equal regions (Q-27)
@@ -229,6 +234,20 @@ def x0_position_stream(x: SparseRows, ptr: np.ndarray, hw: HW) -> tuple[str, np.
         fmt = "index" if ix_b.sum() < bm_b.sum() else "bitmap"
     assert fmt in ("bitmap", "index"), hw.x0_format
     return ("x0_bitmap", bm_l) if fmt == "bitmap" else ("x0_index", ix_l)
+
+
+def expander_cycles(x: SparseRows, hw: HW) -> np.ndarray:
+    """Cycles per node of the index → bitmap expander (S-15): one 256-bit bitmap word per
+    cycle, a word holding n_w indices takes max(1, ⌈n_w / expander_idx⌉) cycles."""
+    f_pad = -(-x.F // package.BITMAP_WORD) * package.BITMAP_WORD
+    words = -(-f_pad // hw.scan_bits)
+    out = np.full(x.n, words, dtype=np.int64)
+    if x.val.size:
+        key = x.rows() * (words + 1) + x.col // hw.scan_bits
+        uk, nw = np.unique(key, return_counts=True)
+        extra = -(-nw // hw.expander_idx) - 1
+        np.add.at(out, uk // (words + 1), extra)
+    return out
 
 
 def contiguous_lines(ptr: np.ndarray, bits_per_node: int, hw: HW) -> np.ndarray:
@@ -549,6 +568,11 @@ def simulate(prog: Program, ptr: np.ndarray, func: list[LayerResult], hw: HW = H
     x0_pkg, _ = package_lines(prog.x0, prog.layers[0].bits, ptr, hw)
     x0_pos_name, x0_pos = x0_position_stream(prog.x0, ptr, hw)
     info["x0_format"] = x0_pos_name
+    # the expander turns indices into bitmaps as they arrive (S-15): a stage between DRAM
+    # and the Input Buffer, so subgraph k's combination cannot end before its expansion
+    expanding = x0_pos_name == "x0_index"
+    exp_sub = seg_sum(expander_cycles(prog.x0, hw), ptr) if expanding else np.zeros(K)
+    exp_end_prev = t
     w = wtraf[0]
     first_w = {"weights": w["load_lines"]}
     if eid_resident:
@@ -570,6 +594,11 @@ def simulate(prog: Program, ptr: np.ndarray, func: list[LayerResult], hw: HW = H
         cs = max(comb_end_prev, first)
         work = max(comb0_sub[k], cond0_sub[k])
         ce = max(cs + work, done)
+        if expanding:
+            # expansion starts with k's first data, after k−1's expansion; it streams, so it
+            # cannot finish before the data does
+            exp_end_prev = max(max(exp_end_prev, first) + exp_sub[k], done)
+            ce = max(ce, exp_end_prev + 1)
         pending_w = {"sparse_w": ctraf[0].flush_lines_by_src_sub[k]}
         if not b_onchip[0]:
             pending_w["b_int_w"] = b_lines[0][k]
@@ -578,7 +607,8 @@ def simulate(prog: Program, ptr: np.ndarray, func: list[LayerResult], hw: HW = H
     pending_w["sparse_w"] = pending_w.get("sparse_w", 0) + ctraf[0].end_flush_lines
     dram.xfer(pending_t, pending_w)
     s.end = max(comb_end_prev, dram.free) + hw.fill
-    s.busy = {"comb": float(comb[0].sum()), "condense": float(cond[0].sum())}
+    s.busy = {"comb": float(comb[0].sum()), "condense": float(cond[0].sum()),
+              "expander": float(exp_sub.sum())}
     s.dram_lines = {k: v - lines0.get(k, 0) for k, v in dram.lines.items()}
     s.dram_busy = dram.busy - busy0
     sweeps.append(s)

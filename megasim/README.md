@@ -196,16 +196,22 @@ Updated 2026-11-23 with S-15's X̄⁽⁰⁾ position format (column indices wher
 unchanged). The original bitmap accounting gave Cora 1.70 MB / 119.2 µJ, CiteSeer 5.03 / 323.3,
 NELL 556.3 / 36,331, GIN-Cora 1.70, GIN-CiteSeer 5.03, Sage-Cora 4.21 (`--x0-format bitmap`).
 
+Updated 2026-11-25: the index → bitmap expander that reading indices requires is now counted
+(S-15): 0.006 mm² (total 1.875 mm²), 1.5 mW while busy, and a streaming stage in sweep 0.
+- Times: unchanged. The expander keeps pace with combination; NELL gains 3 cycles.
+- Energy: +0.03 % on Cora/CiteSeer, +0.29 % on NELL (23.7 µJ). Nothing on PubMed and
+  Amazon-Ratings, which read bitmaps, but they still carry its area.
+
 | Run | K | Time µs | DRAM MB | Energy µJ | DRAM % | SRAM % | PU % | Leakage % | Row hit | DRAM stall | X̄⁽⁰⁾ positions |
 |---|---|---|---|---|---|---|---|---|---|---|---|
 | gcn_cora | 11 | 58.8 | 1.33 | 97.8 | 80.1 | 9.2 | 1.6 | 9.1 | 0.91 | 0.8 % | index |
 | gcn_citeseer | 14 | 91.0 | 3.76 | 249.0 | 88.7 | 4.9 | 0.9 | 5.5 | 0.95 | 0.3 % | index |
 | gcn_pubmed | 80 | 441.9 | 7.20 | 573.5 | 73.8 | 12.5 | 2.1 | 11.6 | 0.87 | 0.2 % | bitmap |
-| gcn_nell | 383 | 16,687 | 76.19 | 8,140 | 55.0 | 9.5 | 4.5 | 31.0 | 0.91 | 0.0 % | index |
+| gcn_nell | 383 | 16,687 | 76.19 | 8,164 | 54.8 | 9.5 | 4.8 | 30.9 | 0.91 | 0.0 % | index |
 | gin_cora | 11 | 60.0 | 1.33 | 98.0 | 79.9 | 9.2 | 1.6 | 9.2 | 0.91 | 0.5 % | index |
-| gin_citeseer | 14 | 82.7 | 3.76 | 247.2 | 89.3 | 4.8 | 0.8 | 5.1 | 0.95 | 1.2 % | index |
+| gin_citeseer | 14 | 82.7 | 3.76 | 247.2 | 89.3 | 4.8 | 0.9 | 5.0 | 0.95 | 1.2 % | index |
 | gin_amazon-ratings | 99 | 1,570 | 6.98 | 895.9 | 45.8 | 23.6 | 4.2 | 26.5 | 0.86 | 0.0 % | bitmap |
-| sage_cora | 22 | 97.5 | 3.84 | 260.3 | 86.7 | 6.7 | 1.0 | 5.7 | 0.94 | 0.5 % | index |
+| sage_cora | 22 | 97.5 | 3.84 | 260.3 | 86.6 | 6.7 | 1.0 | 5.7 | 0.94 | 0.5 % | index |
 
 Findings:
 - **Ramulator changes the time by at most 0.7 % compared with the M2 server** (−0.7 … +0.1 %).

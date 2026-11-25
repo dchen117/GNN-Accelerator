@@ -168,3 +168,13 @@ def test_x0_position_format(prog):
     ri = timing.simulate(p2, part.ptr, func, hw_i, dram=timing.IdealDram(hw_i))
     assert rb.total_cycles == ri.total_cycles
     assert rb.dram_bytes["x0_bitmap"] == lb.sum() * 64 and ri.dram_bytes["x0_index"] == li.sum() * 64
+
+
+def test_expander_cycles():
+    """S-15 expander: one 256-bit word per cycle, ≤ expander_idx indices per cycle."""
+    from megasim.program import SparseRows
+    hw = timing.HW(expander_idx=2)
+    x = np.zeros((2, 600), dtype=np.int64)          # 600 → 608 padded → 3 words per node
+    x[0, [1, 2, 3, 300]] = 1                        # word 0: 3 idx (2 cycles), word 1: 1
+    x[1, 599] = 1
+    assert timing.expander_cycles(SparseRows.from_dense(x), hw).tolist() == [4, 3]

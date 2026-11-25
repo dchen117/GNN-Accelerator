@@ -14,6 +14,14 @@ PU       Tab.IV power of each processing unit × the cycles it is busy (from the
          energy). "Others" (0.80 mW) is charged for the whole run.
 Leakage  CACTI leakage of all buffers × run time. PU leakage is inside the PU powers
          (we cannot separate it without the netlist).
+
+Units MEGA does not have (ADDED_UNITS) are counted, never assumed free (user, 2026-11-25):
+  expander  index → bitmap expander in front of the Input Buffer (S-15), used when X̄⁽⁰⁾'s
+            positions come from DRAM as indices. Our estimate (docs/simulator/00-design.md
+            S-15): ≈ 8,500 NAND2-eq (8 one-hot 8→256 decoders, 256-bit 8-input OR, 256-bit
+            output register, 2 × 8 × 16-bit index FIFO, control) → 0.006 mm² at 0.5 µm² per
+            NAND2 and 70 % utilization. Power = MEGA's own Decoder power density
+            (Tab.IV 0.75 mW / 0.003 mm²) × that area = 1.5 mW while busy.
 """
 
 from __future__ import annotations
@@ -27,6 +35,12 @@ PU_MW = {"bse": 14.70, "aggregation": 28.92, "crossbar": 5.56, "condense": 1.19,
          "encoder": 1.81, "decoder": 0.75, "others": 0.80}
 PU_BUSY = {"bse": "comb", "crossbar": "comb", "decoder": "comb", "aggregation": "agg",
            "encoder": "enc", "condense": "condense"}
+TAB_IV_AREA_MM2 = 1.869        # measured total (Tab.IV)
+# units we add to MEGA: area (mm²), power while busy (mW), timing-model busy key
+# `present`: whether the configured hardware includes the unit (area is counted then, even on a
+# dataset where it never runs; energy only for the cycles it works)
+ADDED_UNITS = {"expander": {"area_mm2": 0.006, "mW": 1.5, "busy": "expander",
+                            "present": lambda hw: hw.x0_format != "bitmap"}}
 
 
 def energy(rep, block: int = cacti.BLOCK) -> dict:
@@ -48,6 +62,10 @@ def energy(rep, block: int = cacti.BLOCK) -> dict:
             busy[k] = busy.get(k, 0.0) + v
     pu_pJ_by = {u: PU_MW[u] * busy.get(k, 0.0) * ns for u, k in PU_BUSY.items()}   # mW·ns = pJ
     pu_pJ_by["others"] = PU_MW["others"] * rep.total_cycles * ns
+    # added units: area if the hardware has them, energy for the cycles they work
+    added = {u: c for u, c in ADDED_UNITS.items() if c["present"](hw)}
+    for u, c in added.items():
+        pu_pJ_by[u] = c["mW"] * busy.get(c["busy"], 0.0) * ns
     # leakage
     leak_mW = sum(c["leak_mW"] for c in bufs.values())
     leak_pJ = leak_mW * rep.total_cycles * ns
@@ -58,4 +76,6 @@ def energy(rep, block: int = cacti.BLOCK) -> dict:
             "sram_uJ": {k: v * 1e-6 for k, v in sram_pJ_by.items()},
             "pu_uJ": {k: v * 1e-6 for k, v in pu_pJ_by.items()},
             "avg_power_mW": total * 1e-6 / (rep.total_cycles * ns * 1e-9) * 1e3,
-            "dram_pJ_per_bit": DRAM_PJ_PER_BIT, "sram_leak_mW": leak_mW}
+            "dram_pJ_per_bit": DRAM_PJ_PER_BIT, "sram_leak_mW": leak_mW,
+            "added_units": sorted(added),
+            "area_mm2": TAB_IV_AREA_MM2 + sum(c["area_mm2"] for c in added.values())}

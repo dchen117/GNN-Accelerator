@@ -95,9 +95,11 @@ Each line is counted, not assumed free:
   - Extra SRAM reads and writes in the energy model.
 - DRAM: new streams `x_res_w` and `x_res_r` in Ramulator (bandwidth, stalls, energy).
 
-Related: the S-15 index → bitmap expander (`docs/simulator/00-design.md`) is a component we
-currently leave unmodelled. Under the rule above it should be counted too. This is noted for
-R3, where the logic cost model gets built anyway.
+Related: the S-15 index → bitmap expander, a baseline component, is counted the same way
+since 2026-11-25 (user): `energy.ADDED_UNITS`, `timing.expander_cycles`, and
+`docs/simulator/00-design.md` S-15. Residual units will use the same mechanism: a gate-count
+area estimate, power from the power density of a comparable Tab.IV unit, and charged busy
+cycles.
 
 ## Milestones
 

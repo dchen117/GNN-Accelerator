@@ -306,10 +306,33 @@ the smaller of two formats, chosen once per layer (`HW.x0_format = "auto"`, defa
      clears the node's F-bit bitmap and sets one bit per index. Everything downstream is
      unchanged, so the timing and SRAM counts stay those of the bitmap format.
      - The expander writes F bits per node into the Input Buffer, which the bitmap format
-       also did, and needs one comparator/decoder per index per cycle.
-     - Its logic area and energy are not modelled. That is small next to DRAM, but it is not
-       in Tab.IV.
+       also did, so the SRAM counts are unchanged.
      - NELL's 7.7 KB bitmap per node still has to fit the Input Buffer, as before.
+     - **Counted since 2026-11-25** (user: no added component is free; this applies to the
+       baseline too):
+       - *Micro-architecture (ours).* Indices arrive sorted per node. Each cycle the unit
+         emits one 256-bit bitmap word, the scan width of Q-23, and sets up to 8 indices
+         that fall in it through 8 one-hot 8→256 decoders ORed together. A word with n_w
+         indices takes max(1, ⌈n_w/8⌉) cycles (`timing.expander_cycles`, `HW.expander_idx`).
+         With 8 indices per cycle it is within 1 % of the bitmap-scan rate on Cora,
+         CiteSeer and NELL. With 4 it is up to 23 % slower on Cora, so we use 8.
+       - *Timing.* It is a streaming stage between DRAM and the Input Buffer in sweep 0.
+         Subgraph k's expansion starts with its first data, after k−1's expansion, and
+         cannot end before its data does. k's combination cannot end before k's expansion.
+       - *Area (our estimate):* ≈ 8,500 NAND2-eq, which gives 0.006 mm² at 0.5 µm² per NAND2
+         and 70 % utilization. The breakdown:
+         - 8 decoders: ≈ 3,400
+         - 256-bit 8-input OR: ≈ 2,400
+         - 256-bit output register: ≈ 1,150
+         - 2 × 8 × 16-bit index FIFO: ≈ 1,150
+         - comparators and control: ≈ 400
+
+         That is +0.3 % on Tab.IV's 1.869 mm². The area is counted whenever the hardware
+         supports the index format (`--x0-format auto|index`), including datasets where
+         bitmaps are chosen.
+       - *Energy:* 1.5 mW while busy. That is MEGA's own Decoder power density (Tab.IV:
+         0.75 mW in 0.003 mm²) times the area, charged like the other PUs: power × busy
+         cycles (`energy.ADDED_UNITS`).
   2. **Indices straight to the Weight Index Generator.** The indices *are* the W̄ row indices
      the Parallel Sum Unit computes from the bitmap, so the scan could be skipped.
      - This is faster: NELL drops from 240 to a few cycles per node. It is also a bigger
@@ -317,7 +340,8 @@ the smaller of two formats, chosen once per layer (`HW.x0_format = "auto"`, defa
      - Not chosen. It would make our MEGA ~50× faster than SGCN on NELL, against the paper's
        2.6×, and it departs further from the described hardware.
 - **Consequence:** option 1 is consistent hardware. MEGA pays the bitmap scan on chip, and
-  DRAM carries the compact list. It still adds one unit the paper does not show. For a strict
+  DRAM carries the compact list. It adds one unit the paper does not show, and that unit is
+  now counted. For a strict
   MEGA-as-described baseline, use `--x0-format bitmap`. The cost is NELL's 480 MB, which the
   paper's own numbers contradict.
   - Why keep the scan time: it is the conservative choice for MEGA (see option 2).
@@ -333,7 +357,16 @@ the smaller of two formats, chosen once per layer (`HW.x0_format = "auto"`, defa
   | DRAM (MB), before → after | 1.70 → 1.33 | 5.03 → 3.76 | 7.20 → 7.20 | 556.3 → 76.2 |
   | time | unchanged | unchanged | unchanged | unchanged |
 
-- `--x0-format bitmap` restores the M3 accounting (`runs/hw/megasim_m3_bitmap.json`).
+- **Effect of counting the expander (2026-11-25, M3).**
+  - Time is unchanged on every run: NELL +3 cycles, others 0. Its 256-bit/cycle rate matches
+    the bitmap scan, which bounds combination, and it works on subgraph k+1 while k computes.
+    It is busy 28 % (Cora), 55 % (CiteSeer) and 95 % (NELL) of the time.
+  - Energy: +0.03 % on Cora/CiteSeer, +0.29 % on NELL (+23.7 µJ), 0 on PubMed and
+    Amazon-Ratings (bitmaps chosen).
+  - Area: 1.869 → 1.875 mm² on every run.
+  - MEGA ÷ SGCN energy geomean: 8.06× → 8.05×.
+- `--x0-format bitmap` restores the M3 accounting (`runs/hw/megasim_m3_bitmap.json`). It is
+  also the only setting without the expander's area.
 - **Not changed: W̄⁽⁰⁾ row-cache misses** (Q-35), now 51–79 % of DRAM on Cora/CiteSeer/
   Sage-Cora. The paper does not say how it handles a W̄ larger than the Weight Buffer, and
   nothing in it contradicts our row cache.
