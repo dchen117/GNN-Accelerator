@@ -143,3 +143,165 @@ std: `mega_pt/README.md` results log, 2026-11-25. Runs: `runs/res4/`.
   the hardware work.
 - `megasim.check` is bit-exact on seed 0 of all six residual models, so R3 runs on real
   4-layer models.
+
+## Residual study (2026-11-25): depth, form, quantization loss, training time
+
+The user asked four questions after R1. Runs: `runs/resstudy/` (64 jobs) and `runs/resstudy2/`
+(follow-ups). Tables: `python -m mega_pt.res_table runs/res4 runs/resstudy runs/resstudy2`.
+Forms: **plain** = no residual; **pre** = ReLU(ÃXW + X) (R1's form); **post** = ReLU(ÃXW) + X
+(`--res-form post`). Both forms cost the same in the Encoder: one multiply-add per value, and
+only the ReLU moves. Both are bit-exact in megasim (unit tests).
+Seeds: 3; Paris 2 (its seed std is 0.1–0.3).
+
+### Q1. Residual at 2 layers
+
+- **Not defined for an identity residual.** Layer 0 is F → 128 and layer 1 is 128 → C;
+  neither has F_in = F_out.
+- **3 layers** (F → 128 → 128 → C, one residual layer) is the shallowest identity-residual
+  network.
+- **A projection skip** (+ X·W_s) would work at 2 layers.
+  - On the last layer it is GraphSage's self weight; W_s is 128 × C, so it is cheap.
+  - On layer 0 it would double the largest combination.
+  - Not built yet.
+
+QAT test % (FP32 in brackets), recipe λ:
+
+| Dataset | 2-layer | 3 plain | 3 pre | 3 post | 4 plain | 4 pre | 4 post |
+|---|---|---|---|---|---|---|---|
+| Cora | **81.67** | 80.33 (81.90) | 80.33 (81.83) | 80.40 (82.53) | 78.13 | 79.33 | 78.40 |
+| CiteSeer | **70.35** | 66.53 (68.70) | 66.97 (70.13) | 67.03 (69.70) | 60.70 | 62.60 | 63.30 |
+| PubMed | 78.97 | **80.40** (77.90) | 79.40 (77.70) | 80.00 (77.67) | 77.70 | 78.47 | 78.53 |
+| Roman-Empire | 46.53 | 36.02 (34.51) | **51.45** (52.91) | 51.30 (51.99) | 33.69 | 49.55 | 50.56 |
+| Amazon-Ratings | **47.92** | 46.62 (46.52) | 47.56 (48.08) | 47.63 (47.88) | 46.73 | 46.51 | 46.72 |
+| Paris | 24.18 | 26.58 (32.62) | 26.23 (31.83) | 25.76 (30.78) | **27.35** | 26.78 | 25.89 |
+
+- At 3 layers the residual matters only on Roman-Empire: +15 points, and 51.45 is the best
+  Roman-Empire result at any depth, 5 points over the 2-layer model.
+- Elsewhere it is within about 1 point of plain.
+
+### Q2. Why the residual does not help everywhere: deeper networks and the post form
+
+FP32 test %, the same 200 epochs (QAT would add the quantization confound):
+
+| Dataset | 2 | 4 plain / pre / post | 8 plain / pre / post | 16 pre / post |
+|---|---|---|---|---|
+| Cora | 81.65 | 78.67 / 80.23 / 80.83 | 34.43 / 79.53 / 80.17 | 71.17 / 74.67 |
+| CiteSeer | 71.23 | 66.53 / 70.20 / 68.93 | 26.73 / 67.03 / 65.33 | 57.67 / 63.13 |
+| PubMed | 78.99 | 75.83 / 76.33 / 76.97 | 55.60 / 76.47 / 76.07 | 69.83 / 71.13 |
+| Roman-Empire | 47.43 | 32.94 / 53.84 / 52.38 | 19.67 / 46.32 / 50.11 | 25.15 / 39.16 |
+| Amazon-Ratings | 47.90 | 46.68 / 47.28 / 47.53 | 45.33 / 45.73 / 46.99 | 41.56 / 44.16 |
+| Paris | 27.01 | 33.89 / 33.44 / 31.83 | 32.86 / 31.93 / 30.57 | – |
+
+1. **The residual stops the collapse but does not make depth pay.**
+   - Without it, 8 layers collapse: Cora 34%, CiteSeer 27%, PubMed 56%, Roman-Empire 20%.
+   - With it, 8 layers stay within 1–3 points of 4 layers.
+   - But every dataset's best depth is 2–4, with or without the residual. More layers
+     (8, 16) do not reveal a residual benefit; they lose accuracy.
+2. **On the citation graphs (Cora, CiteSeer, PubMed) depth is not the bottleneck.**
+   - Their FP32 best-val epoch is 9–60 out of 200: the models overfit about 20 training
+     nodes per class within a few dozen epochs.
+   - Extra layers only add parameters and smoothing.
+   - This is the usual result for these graphs. The residual can recover what depth loses,
+     not what 2 layers already reach.
+3. **Roman-Empire is where the residual matters.** Even at 3 layers it gains 15–19 points.
+   - On a heterophilic graph a node's neighbors mostly have other labels, so a node needs its
+     own features separated from the aggregate (ego/neighbor separation).
+   - The identity residual carries the node's own features past the averaging.
+   - Amazon-Ratings is heterophilic too, but GCN gains little there from either depth or the
+     residual (all within 1.5 points).
+4. **Paris gains from depth itself:** plain 4 layers beats 2 layers by 7 points (FP32).
+   - The residual costs 0.5–2 points there, more for post.
+   - Its long-range signal needs more hops, not the self features.
+5. **pre vs post.**
+   - At 8–16 layers, post is better on Cora, Roman-Empire, Amazon-Ratings, and at 16 layers
+     on CiteSeer and PubMed (Roman-Empire 16 layers: 39.2 vs 25.2).
+   - pre is better on Paris and at 8 layers on CiteSeer and PubMed.
+   - At 3–4 layers they are within about 1 point; post is ahead on Roman-Empire, CiteSeer and
+     PubMed at 4 layers.
+   - **Post needs more bits:** sparse avg 0.61 vs 0.47 (Amazon-Ratings, 4 layers), 1.31 vs 0.90
+     (Roman-Empire), 0.62 vs 0.48 (Paris). ReLU(·) + X only adds non-negative terms, so the
+     values grow layer by layer and need a wider range.
+   - In hardware the bits cost memory and DRAM traffic. post is not a free win.
+6. **Under-training.** Roman-Empire, Amazon-Ratings and Paris peak at epochs 134–198 at 8–16
+   layers, so those deep numbers are lower bounds. Follow-up with 600 FP32 epochs below.
+
+Formulas the literature uses for depth, not tried here:
+- An initial residual, + α·X⁽¹⁾ as in GCNII.
+- A separate self weight, X·W_self (GraphSage's root weight; ego/neighbor separation).
+  Platonov et al. find this matters most on Roman-Empire / Amazon-Ratings.
+
+Both change the hardware: X⁽¹⁾ must be kept for all layers, or a second combination is needed.
+Evaluate them only if depth is a goal for the design.
+
+### Q3. Why quantization loses more at depth: the memory penalty, mostly
+
+4 layers, QAT test % (FP32 in brackets); λ = 0 removes the memory penalty:
+
+| Dataset, form | FP32 | QAT λ = 0 (bits) | QAT recipe λ (bits) |
+|---|---|---|---|
+| CiteSeer plain | 66.53 | 64.30 (4.11) | 60.70 (2.14) |
+| CiteSeer pre | 70.20 | 66.77 (4.48) | 62.60 (2.55) |
+| Roman-Empire plain | 32.94 | 33.38 (1.89) | 33.69 (0.84) |
+| Roman-Empire pre | 53.84 | **53.84** (1.88) | 49.55 (0.90) |
+| Paris plain | 33.92 | 30.82 (1.18) | 27.35 (0.46) |
+| Paris pre | 33.57 | 29.76 (1.22) | 26.78 (0.48) |
+| Cora pre | 80.23 | 79.23 (3.72) | 79.33 (1.34) |
+| PubMed pre | 76.33 | 77.13 (3.22) | 78.47 (0.86) |
+| Amazon-Ratings pre | 47.28 | 47.18 (1.37) | 46.51 (0.47) |
+
+- **The penalty causes most of the extra loss.** Removing it:
+  - Roman-Empire: residual QAT equals FP32 (53.84), so all 4.3 points were the penalty.
+  - CiteSeer: recovers 4.2 of the 7.6 points.
+  - Paris: recovers 3.5 of 6.5.
+  - Cora, PubMed, Amazon-Ratings: the penalty costs ≤ 0.7, and on PubMed it helps (+1.3,
+    regularization).
+- **Why the same λ is harsher at depth.**
+  - M_target is the 2-bit dense floor and b ≥ 2, so the target can never be met.
+  - The penalty λ(M − M_target)² keeps pushing every layer down; its gradient is
+    2λ(M − M_target).
+  - A 4-layer model has 3 hidden inputs instead of 1, so M − M_target, and the push, is larger.
+  - Every layer of Paris, PubMed and Amazon-Ratings ends at 2.00 bits.
+- **What remains at λ = 0 is real quantization error,** and it is larger at depth on CiteSeer
+  (3.4 points) and Paris (3.1–3.8). At 2 layers Paris loses 0.6.
+  - Errors compound through more quantized layers.
+  - B̄ is 4 bits (MEGA): 20–45% of B̄ entries round to zero on these layers (`L*_b_lost_all`).
+- **Answer: yes, λ should be set per depth.** The recipe λ was tuned for 2 layers. λ sweep at
+  4 layers: below.
+
+### Q4. Training time
+
+- Every configuration runs the same 200 FP32 + 200 QAT epochs; the residual does not change
+  the epoch count.
+- Controlled timing: one job at a time, 4 threads, 20 + 20 epochs, seed 0. Seconds per epoch,
+  FP32 / QAT:
+
+| Dataset | 2 layers | 3 plain / pre / post | 4 plain / pre / post | 8 plain / pre / post |
+|---|---|---|---|---|
+| Cora | 0.16* / 0.13 | 0.16 / 0.15 / 0.15 · 0.15 / 0.14 / 0.14 | 0.16 / 0.16 / 0.16 · 0.16 / 0.16 / 0.15 | 0.20 / 0.20 / 0.19 · 0.21 / 0.20 / 0.20 |
+| CiteSeer | 0.31 / 0.52 | 0.33 / 0.32 / 0.31 · 0.52 / 0.51 / 0.52 | 0.33 / 0.34 / 0.33 · 0.54 / 0.57 / 0.55 | 0.39 / 0.38 / 0.37 · 0.66 / 0.60 / 0.58 |
+| PubMed | 0.34 / 0.41 | 0.41 / 0.42 / 0.42 · 0.47 / 0.46 / 0.46 | 0.44 / 0.48 / 0.45 · 0.57 / 0.57 / 0.57 | 0.72 / 0.76 / 0.78 · 0.99 / 0.96 / 0.99 |
+| Roman-Empire | 0.27 / 0.30 | 0.34 / 0.33 / 0.34 · 0.43 / 0.44 / 0.44 | 0.42 / 0.41 / 0.41 · 0.54 / 0.51 / 0.52 | 0.68 / 0.71 / 0.70 · 0.98 / 0.94 / 1.00 |
+| Amazon-Ratings | 0.30 / 0.32 | 0.40 / 0.42 / 0.42 · 0.46 / 0.46 / 0.46 | 0.49 / 0.53 / 0.52 · 0.61 / 0.64 / 0.61 | 0.91 / 0.87 / 0.93 · 1.21 / 1.19 / 1.20 |
+| Paris | 0.69 / 1.55 | 1.26 / 1.27 / 1.34 · 2.84 / 3.03 / 2.98 | 1.89 / 1.85 / 1.91 · 4.36 / 4.51 / 4.81 | 4.35 / 4.32 / 4.17 · 9.87 / 9.52 / 9.66 |
+
+\* includes warm-up (first job of the benchmark).
+
+- **The residual adds no measurable time,** pre or post, at any depth (within noise, ≤ 5%).
+  The add is one elementwise op next to a sparse matmul.
+- **Time grows about linearly with depth.** Paris is superlinear, from its large N and the
+  memory traffic of the hidden activations.
+- **Epochs to converge** (FP32 best-val epoch, mean of seeds; `fp32_best_epoch` in results):
+
+| Dataset | 3 plain / pre / post | 8 plain / pre / post | 16 pre / post |
+|---|---|---|---|
+| Cora | 19 / 18 / 17 | 103 / 57 / 13 | 183 / 168 |
+| CiteSeer | 88 / 56 / 71 | 71 / 20 / 12 | 156 / 176 |
+| PubMed | 123 / 52 / 53 | 124 / 17 / 51 | 118 / 169 |
+| Roman-Empire | 172 / 190 / 167 | 188 / 189 / 192 | 195 / 198 |
+| Amazon-Ratings | 142 / 177 / 175 | 134 / 164 / 153 | 194 / 194 |
+| Paris | 182 / 186 / 176 | 192 / 191 / 196 | – |
+
+- The residual usually converges **earlier** on the citation graphs at 8 layers (Cora 57 / 13
+  vs 103 plain; PubMed 17 / 51 vs 124).
+- Roman-Empire, Amazon-Ratings and Paris are still improving at epoch 200 at every depth.
+- At 16 layers everything peaks late.
