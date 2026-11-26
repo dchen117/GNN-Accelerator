@@ -223,7 +223,31 @@ FP32 test %, the same 200 epochs (QAT would add the quantization confound):
      values grow layer by layer and need a wider range.
    - In hardware the bits cost memory and DRAM traffic. post is not a free win.
 6. **Under-training.** Roman-Empire, Amazon-Ratings and Paris peak at epochs 134–198 at 8–16
-   layers, so those deep numbers are lower bounds. Follow-up with 600 FP32 epochs below.
+   layers, so those deep numbers are lower bounds. Follow-up with 600 FP32 epochs:
+
+**Follow-up: 600 FP32 epochs** (`runs/resstudy2`, same recipe otherwise; FP32 test %, best-val
+epoch in brackets):
+
+| Dataset, L, form | 200 epochs | 600 epochs | seeds |
+|---|---|---|---|
+| Paris 4 plain | 33.92 (≈190) | 35.42 (599) | 1 |
+| Paris 8 plain | 32.86 (192) | 35.46 (556) | 1 |
+| Roman-Empire 4 pre | 53.84 | **56.41** (535) | 3 |
+| Roman-Empire 8 pre | 46.32 (189) | 54.89 (589) | 3 |
+| Roman-Empire 8 post | 50.11 (192) | 53.81 (566) | 3 |
+| Roman-Empire 16 post | 39.16 (198) | 46.61 (590) | 3 |
+| Amazon-Ratings 8 post | 46.99 (153) | 47.34 (284) | 3 |
+
+- **Most of the depth penalty on Roman-Empire and Paris was under-training.** With 600 epochs
+  the 8-layer models close to within 1.5 points of 4 layers (Roman-Empire) or tie them
+  (Paris), but **they still do not beat 4 layers.** Deep models need ~3× the epochs to get
+  there, and 16 layers stay 10 points behind.
+- Even at 600 epochs the best-val epoch is near the end (535–599), so these are still lower
+  bounds; the 4-layer models are under-trained too.
+- Amazon-Ratings converges at ~280 epochs and gains only 0.35.
+- Caveat: the 2-layer references are also 200-epoch runs. A fair depth comparison would
+  give every depth the same longer schedule; not done (the recipe stays at 200 for the
+  baseline comparison).
 
 Formulas the literature uses for depth, not tried here:
 - An initial residual, + α·X⁽¹⁾ as in GCNII.
@@ -265,8 +289,27 @@ Evaluate them only if depth is a goal for the design.
   (3.4 points) and Paris (3.1–3.8). At 2 layers Paris loses 0.6.
   - Errors compound through more quantized layers.
   - B̄ is 4 bits (MEGA): 20–45% of B̄ entries round to zero on these layers (`L*_b_lost_all`).
-- **Answer: yes, λ should be set per depth.** The recipe λ was tuned for 2 layers. λ sweep at
-  4 layers: below.
+- **Answer: yes, λ should be set per depth.** The recipe λ was tuned for 2 layers.
+
+**λ sweep at 4 layers** (`runs/resstudy2`; QAT test %, sparse avg bits in brackets; FP32 from
+the shared cache):
+
+| Dataset, form (FP32) | λ = 0 | 1e-9 | 1e-8 | 1e-7 | 1e-6 |
+|---|---|---|---|---|---|
+| CiteSeer pre (70.20) | 66.77 (4.48) | – | 65.90 (4.00) | 64.13 (3.36) | 62.60 (2.55) ← recipe |
+| Roman-Empire pre (53.84) | 53.84 (1.88) | **54.12** (1.83) | 52.21 (1.29) | 49.55 (0.90) ← recipe | – |
+| Paris plain (33.92) | 30.82 (1.18) | – | **28.41 (0.47)** | 27.35 (0.46) ← recipe | – |
+
+- **The trade-off is smooth on CiteSeer and Roman-Empire:** each 10× in λ costs ~1–2.5 points
+  and saves ~0.4–0.9 bits. There is no free lunch; λ picks a point on the curve.
+- **Paris λ = 1e-8 is a free win:** +1.06 points at the same 0.47 bits as the recipe. The
+  recipe λ over-pushes Paris 4 layers; 1e-8 reaches the same floor more gently.
+- λ ≤ 1e-9 is effectively λ = 0 (same bits, same accuracy).
+- **Implication for comparisons:** a depth's accuracy and its bits must be read together.
+  Comparing 2- vs 4-layer (or plain vs residual) at one λ mixes the depth effect with a
+  different point on the accuracy/memory curve. Better options: match bits (choose λ per
+  configuration to hit a common sparse avg), or normalize the penalty per layer, e.g.
+  λ·Σₗ(Mₗ − Mₗ,target)² / (L − 1). Not implemented yet.
 
 ### Q4. Training time
 

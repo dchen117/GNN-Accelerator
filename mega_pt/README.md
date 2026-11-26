@@ -649,3 +649,14 @@ test % and sparse avg bits; the 2-layer column is the QAT row of the λ-sweep / 
   fetches a GitHub LFS mirror and verifies each file's sha256 (see `data.py`).
 - **Scales treated as exact:** the scale multiplications (α·β, γ, d^(−1/2)) are assumed
   exact. Their hardware precision is still open (Q-16).
+
+### 2026-11-26 — Residual study follow-ups: 600 FP32 epochs, λ sweep at 4 layers
+
+Details and tables: `docs/beyond-mega/02-residual.md`, "Residual study". Runs in
+`runs/resstudy2`; tables via `python -m mega_pt.res_table runs/resstudy2`.
+- 600 FP32 epochs: Roman-Empire 8-layer pre 46.3 → 54.9, 16-layer post 39.2 → 46.6;
+  Paris 8-layer plain 32.9 → 35.5 (ties 4 layers, 35.4). Deep models were under-trained, but
+  still do not beat 4 layers; best-val epochs remain at 535–599.
+- λ sweep (4 layers): accuracy vs bits is a smooth trade-off on CiteSeer / Roman-Empire;
+  Paris λ = 1e-8 gives +1.1 points at the recipe's 0.47 bits. λ should be chosen per depth
+  (or bits-matched) before comparing depths.
