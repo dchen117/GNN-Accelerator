@@ -138,6 +138,11 @@ class Graph:
     val_idx: torch.Tensor
     test_idx: torch.Tensor
     splits: list | None = None
+    # Evaluation metric (2026-11-26): "acc" (top-1 accuracy) or "auc" (ROC-AUC of class 1).
+    # Minesweeper / Tolokers / Questions are binary and imbalanced (20% / 22% / 3% positives);
+    # Platonov et al. report ROC-AUC for them, so we do too. results.json keeps the key names
+    # fp32_test / q_test; their value is ROC-AUC for these datasets.
+    metric: str = "acc"
 
     def use_split(self, i: int) -> "Graph":
         """Same graph, with train/val/test set to published split i (mod the number of splits)."""
@@ -210,13 +215,16 @@ def _build_edges(graph: dict, n: int):
 
 
 DATASETS = ("cora", "citeseer", "pubmed", "nell", "reddit",
-            "roman-empire", "amazon-ratings", "city-paris")
+            "roman-empire", "amazon-ratings", "city-paris",
+            "minesweeper", "tolokers", "questions")
 # Input preprocessing when --feat-norm is not given. MEGA's bag-of-words sets keep the Q-14
 # choice (row). The others hold embeddings / mixed-unit columns where a row sum is not
 # meaningful (it can be ~0); there we z-score each column. See docs/beyond-mega/01-extra-datasets.md.
 DEFAULT_FEAT_NORM = {"cora": "row", "citeseer": "row", "pubmed": "row", "nell": "row",
                      "reddit": "none", "roman-empire": "std", "amazon-ratings": "std",
-                     "city-paris": "std"}
+                     "city-paris": "std", "minesweeper": "std", "tolokers": "std",
+                     "questions": "std"}
+AUC_DATASETS = ("minesweeper", "tolokers", "questions")   # binary; ROC-AUC (Platonov et al.)
 
 
 def load_dataset(name: str, feat_norm: str | None = None) -> Graph:
@@ -225,7 +233,7 @@ def load_dataset(name: str, feat_norm: str | None = None) -> Graph:
     feat_norm = feat_norm or DEFAULT_FEAT_NORM[name]
     if name == "nell":
         return load_nell(feat_norm=feat_norm)
-    if name in ("roman-empire", "amazon-ratings"):
+    if name in ("roman-empire", "amazon-ratings") + AUC_DATASETS:
         return load_heterophilous(name, feat_norm=feat_norm)
     if name == "city-paris":
         return load_city("paris", feat_norm=feat_norm)
@@ -375,6 +383,13 @@ EXTRA_FILES = {
                      "a58ba741d123bf892fe5c872138d07463d75a2e9012360b8dd78ac2d4766d428"),
     "amazon-ratings": ("https://raw.githubusercontent.com/yandex-research/heterophilous-graphs/main/data/amazon_ratings.npz",
                        "4c3a3e3b9d9f6cba0fede4625a00aad8c5721c1a36ed771367f446763241c7dd"),
+    # Added 2026-11-26 (residual study, docs/beyond-mega/02-residual.md); hashes from that day
+    "minesweeper": ("https://raw.githubusercontent.com/yandex-research/heterophilous-graphs/main/data/minesweeper.npz",
+                    "e664c8dacf1e8ac466c2c09ed4b237bd2c5541f47a6eae9c6092cb87f16412b3"),
+    "tolokers": ("https://raw.githubusercontent.com/yandex-research/heterophilous-graphs/main/data/tolokers.npz",
+                 "dacf3ac94cec53d03cd2adb5255c08b33dee1656c33ca8164a464bd9450a1667"),
+    "questions": ("https://raw.githubusercontent.com/yandex-research/heterophilous-graphs/main/data/questions.npz",
+                  "757ebd772bab1475c4dd951ca9e364400c6db161656cff9d21780ee874cf3074"),
     # Liang et al. 2025 (NeurIPS), github.com/LeonResearch/City-Networks (same files PyG 2.7 uses)
     "city-paris": ("https://raw.githubusercontent.com/LeonResearch/City-Networks/main/data/paris.tar.gz",
                    "e7b12f028aceb8057b8cbb65d5c89d95dba3122483c0419cec9872e9d652b41a"),
@@ -463,7 +478,9 @@ def _graph(name, x, y, src, dst, deg, splits) -> Graph:
 
 
 def load_heterophilous(name: str, feat_norm: str = "std") -> Graph:
-    """Roman-Empire / Amazon-Ratings (Platonov et al. 2023). Accuracy is their metric for both.
+    """Platonov et al. 2023 heterophilous graphs. Roman-Empire / Amazon-Ratings: accuracy.
+    Minesweeper / Tolokers / Questions (added 2026-11-26 for the residual study): binary,
+    ROC-AUC (Graph.metric = "auc"), as in the paper.
     The .npz holds node_features, node_labels, edges (E,2) and 10 boolean split masks
     (50/25/25). The authors make the graph bidirected; _edges_from_pairs does the same."""
     z = np.load(_fetch(name), allow_pickle=False)
@@ -472,7 +489,9 @@ def load_heterophilous(name: str, feat_norm: str = "std") -> Graph:
     src, dst, deg = _edges_from_pairs(e[:, 0], e[:, 1], x.shape[0])
     splits = [tuple(np.flatnonzero(z[k][i]) for k in ("train_masks", "val_masks", "test_masks"))
               for i in range(z["train_masks"].shape[0])]
-    return _graph(name, x, z["node_labels"], src, dst, deg, splits)
+    g = _graph(name, x, z["node_labels"], src, dst, deg, splits)
+    g.metric = "auc" if name in AUC_DATASETS else "acc"
+    return g
 
 
 def load_city(city: str = "paris", feat_norm: str = "std") -> Graph:

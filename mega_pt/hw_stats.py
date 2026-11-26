@@ -47,7 +47,7 @@ from types import SimpleNamespace
 import torch
 
 from .data import load_dataset
-from .metrics import accuracy
+from .metrics import score
 from .model import GraphOps, QGCN
 from .quant import qmax_from_bits
 
@@ -278,11 +278,11 @@ def main(argv=None):
         fake = model(g.x, ops)
     stats: dict = {}
     exact = int_forward(model, g.x, ops, None, stats)
-    res = {"run": a.run_dir, "fake_test": accuracy(fake, g.y, g.test_idx),
-           "int_exact_test": accuracy(exact, g.y, g.test_idx),
+    res = {"run": a.run_dir, "fake_test": score(fake, g.y, g.test_idx, g.metric),
+           "int_exact_test": score(exact, g.y, g.test_idx, g.metric),
            "int_vs_fake_agree": (exact.argmax(1) == fake.argmax(1)).float().mean().item()}
     for fmt in a.formats.split(","):
-        res[f"int_{fmt}_test"] = accuracy(int_forward(model, g.x, ops, fmt), g.y, g.test_idx)
+        res[f"int_{fmt}_test"] = score(int_forward(model, g.x, ops, fmt), g.y, g.test_idx, g.metric)
     for l, st in stats.items():
         res[f"L{l}"] = {**accumulator_ranges(st), **bse_utilization(st),
                         **{f"range_{k}": range_summary(v) for k, v in st["tables"].items()}}

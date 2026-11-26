@@ -28,6 +28,32 @@ def accuracy(logits: torch.Tensor, y: torch.Tensor, idx: torch.Tensor) -> float:
     return (logits[idx].argmax(1) == y[idx]).float().mean().item()
 
 
+def roc_auc(logits: torch.Tensor, y: torch.Tensor, idx: torch.Tensor) -> float:
+    """ROC-AUC of class 1 for a binary task (Mann-Whitney U, ties count 1/2).
+    Score = logit1 - logit0 (monotone in softmax p1, so the AUC is the same)."""
+    s = (logits[idx, 1] - logits[idx, 0]).double()
+    t = y[idx] == 1
+    n1, n0 = int(t.sum()), int((~t).sum())
+    if n1 == 0 or n0 == 0:
+        return float("nan")
+    order = torch.argsort(s)
+    ss = s[order]
+    ranks = torch.empty_like(s)
+    ranks[order] = torch.arange(1, len(s) + 1, dtype=torch.double)
+    # average ranks over ties
+    uniq, inv, cnt = torch.unique_consecutive(ss, return_inverse=True, return_counts=True)
+    if len(uniq) < len(ss):
+        csum = torch.cumsum(cnt, 0).double()
+        avg = csum - (cnt.double() - 1) / 2
+        ranks[order] = avg[inv]
+    return ((ranks[t].sum() - n1 * (n1 + 1) / 2) / (n1 * n0)).item()
+
+
+def score(logits: torch.Tensor, y: torch.Tensor, idx: torch.Tensor, metric: str = "acc") -> float:
+    """The dataset's evaluation metric (Graph.metric): accuracy or ROC-AUC."""
+    return roc_auc(logits, y, idx) if metric == "auc" else accuracy(logits, y, idx)
+
+
 @torch.no_grad()
 def quant_report(model: QGCN, x: torch.Tensor, ops: GraphOps) -> dict:
     """Eval-mode pass with recording; returns a flat dict of scalar metrics."""

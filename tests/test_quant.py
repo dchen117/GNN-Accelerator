@@ -357,3 +357,17 @@ def test_residual_layers_and_integer_reference():
         outs[res] = fake
     assert not torch.allclose(outs[False], outs["pre"])
     assert not torch.allclose(outs["pre"], outs["post"])
+
+
+def test_roc_auc_matches_pairwise():
+    """metrics.roc_auc (rank formula, ties = 1/2) equals the brute-force pairwise AUC."""
+    import torch
+    from mega_pt.metrics import roc_auc
+    torch.manual_seed(0)
+    logits = torch.randn(300, 2)
+    logits[:80] = logits[:80].round()                 # force ties
+    y = torch.randint(0, 2, (300,))
+    s = logits[:, 1] - logits[:, 0]
+    p, n = s[y == 1][:, None], s[y == 0][None, :]
+    ref = ((p > n).double() + 0.5 * (p == n).double()).mean().item()
+    assert abs(roc_auc(logits, y, torch.arange(300)) - ref) < 1e-12

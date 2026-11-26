@@ -38,7 +38,7 @@ import torch
 import torch.nn.functional as F
 
 from .data import DATASETS, DEFAULT_FEAT_NORM, load_dataset
-from .metrics import accuracy, quant_report
+from .metrics import quant_report, score
 from .model import ETA, MODELS, NORM_MODES, GraphOps, QGCN, residual_layers
 
 
@@ -145,6 +145,7 @@ def train_fp32(model, g, ops, args, train_ops):
     neighbor sample for GraphSage, else the same ops)."""
     opt = torch.optim.Adam(model.weight_params(), lr=args.lr, weight_decay=args.wd)
     best_val, best_state, best_ep = -1.0, None, -1
+    curve = []                                 # val metric per epoch (convergence analysis)
     for ep in range(args.epochs_fp32):
         model.train()
         opt.zero_grad()
@@ -153,15 +154,17 @@ def train_fp32(model, g, ops, args, train_ops):
         opt.step()
         model.eval()
         with torch.no_grad():
-            val = accuracy(model(g.x, ops), g.y, g.val_idx)
+            val = score(model(g.x, ops), g.y, g.val_idx, g.metric)
+        curve.append(round(val, 5))
         if val > best_val:
             best_val, best_ep = val, ep
             best_state = {k: v.clone() for k, v in model.state_dict().items()}
     model.load_state_dict(best_state)
     model.eval()
     train_fp32.best_epoch = best_ep            # read by main() for the results row
+    train_fp32.val_curve = curve               # ditto (2026-11-26): epochs-to-threshold analysis
     with torch.no_grad():
-        return accuracy(model(g.x, ops), g.y, g.test_idx), best_val
+        return score(model(g.x, ops), g.y, g.test_idx, g.metric), best_val
 
 
 def train_qat(model, g, ops, args, m_target_kb, train_ops):
@@ -207,7 +210,7 @@ def train_qat(model, g, ops, args, m_target_kb, train_ops):
         if args.log_every and (ep % args.log_every == 0 or ep == args.epochs_qat - 1):
             model.eval()
             with torch.no_grad():
-                val = accuracy(model(g.x, ops), g.y, g.val_idx)
+                val = score(model(g.x, ops), g.y, g.val_idx, g.metric)
             print(f"  qat ep {ep:4d} task {task.item():.4f} mem {mem.item():9.1f} KB "
                   f"(target {m_target_kb:.1f}) val {val:.4f}")
     if args.clip_refit:
@@ -305,21 +308,26 @@ def main(argv=None):
             fp32_test, fp32_val = ck["fp32_test"], ck["fp32_val"]
             # older caches lack these; NaN marks "not measured" (the FP32 phase was skipped)
             fp32_seconds, fp32_best_epoch = ck.get("fp32_seconds", float("nan")), ck.get("fp32_best_epoch", -1)
+            fp32_val_curve = ck.get("fp32_val_curve")
             print(f"  FP32 model loaded from {cache}")
         else:
             t_fp32 = time.time()
             fp32_test, fp32_val = train_fp32(model, g, ops, args, train_ops)
             fp32_seconds, fp32_best_epoch = round(time.time() - t_fp32, 1), train_fp32.best_epoch
+            fp32_val_curve = train_fp32.val_curve
             if cache:
                 os.makedirs(os.path.dirname(cache), exist_ok=True)
                 torch.save({"model": model.state_dict(), "rng": torch.get_rng_state(),
                             "train_gen": train_gen.get_state() if sampled else None,
                             "fp32_test": fp32_test, "fp32_val": fp32_val,
-                            "fp32_seconds": fp32_seconds, "fp32_best_epoch": fp32_best_epoch}, cache)
+                            "fp32_seconds": fp32_seconds, "fp32_best_epoch": fp32_best_epoch,
+                            "fp32_val_curve": fp32_val_curve}, cache)
         # Phase timings (2026-11-25): wall seconds of the FP32 and QAT phases and the epoch the
         # FP32 best-val model came from (a late best epoch = still improving at --epochs-fp32).
         row = {"seed": seed, "fp32_test": fp32_test, "fp32_val": fp32_val,
                "fp32_seconds": fp32_seconds, "fp32_best_epoch": fp32_best_epoch}
+        if fp32_val_curve is not None:        # list; the summary below skips non-scalars
+            row["fp32_val_curve"] = fp32_val_curve
         if not args.fp32_only:
             model.calibrate(g.x, ops, args.x_init,
                             [float(v) for v in args.x_init_bits.split(",")] if args.x_init_bits else None,
@@ -328,15 +336,15 @@ def main(argv=None):
             model.quant_parts = args.quant_parts
             model.eval()
             with torch.no_grad():
-                row["ptq_test"] = accuracy(model(g.x, ops), g.y, g.test_idx)  # before QAT, for debugging
+                row["ptq_test"] = score(model(g.x, ops), g.y, g.test_idx, g.metric)  # before QAT, for debugging
             t_qat = time.time()
             train_qat(model, g, ops, args, m_target, train_ops)
             row["qat_seconds"] = round(time.time() - t_qat, 1)
             model.eval()
             with torch.no_grad():
                 logits = model(g.x, ops)
-            row["q_test"] = accuracy(logits, g.y, g.test_idx)
-            row["q_val"] = accuracy(logits, g.y, g.val_idx)
+            row["q_test"] = score(logits, g.y, g.test_idx, g.metric)
+            row["q_val"] = score(logits, g.y, g.val_idx, g.metric)
             row.update(quant_report(model, g.x, ops))
             with open(os.path.join(out_dir, f"bits_seed{seed}.json"), "w") as f:
                 json.dump(bit_tables(model), f)
