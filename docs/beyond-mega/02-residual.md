@@ -3,6 +3,18 @@
 **Status (2026-11-25):** R1 (model + integer reference) and R2 (megasim functional model) implemented. R1 done. R3–R4 planned.
 Pointer entry: `docs/mega-kb/04-open-questions.md` Q-36.
 
+> **Bits in this document = bits/nz (changed 2026-11-27).** Every "bits" figure here is the
+> average bit width of a **non-zero** hidden-layer value, `metrics.avg_bits_nz` =
+> Σ nnz(X̄ᵢ)·bᵢ / Σ nnz(X̄ᵢ), over hidden layer inputs X⁽¹⁾… (b ranges 2–8, so the floor is
+> 2.00). Earlier versions used the *sparse* average (`avg_bits_sparse`, Q-15) =
+> bits/nz × hidden density, where zeros count as 0 bits. That number mixed bit width with ReLU
+> sparsity (0.47 "bits" = 2.1 bits × 22% density) and was hard to read. Old results.json files
+> are converted exactly by `res_table.bits_nz` (checked against a direct recomputation on
+> saved models). Memory also depends on density and on the number of hidden layers: a 4-layer
+> model stores three hidden inputs, the 2-layer model one. `res_table` prints bits/nz, density
+> and the old sparse average side by side. The MEGA-baseline docs keep the sparse average:
+> it is the definition that matches the paper's Tab.VI numbers (Q-15).
+
 ## Scope and rules (user, 2026-11-25)
 
 - MEGA has no residual connections (Tab.III: 2-layer GCN/GIN/GraphSage). This work is **not
@@ -120,17 +132,17 @@ cycles.
 
 ## Results
 
-R1, 3 seeds, QAT test % (FP32 in brackets) @ sparse avg bits. Full table with PTQ and
+R1, 3 seeds, QAT test % (FP32 in brackets) @ bits/nz. Full table with PTQ and
 std: `mega_pt/README.md` results log, 2026-11-25. Runs: `runs/res4/`.
 
 | Dataset | 2-layer | 4-layer plain | 4-layer residual |
 |---|---|---|---|
-| Cora | 81.67 | 78.13 (78.67) @ 1.32 | **79.33** (80.23) @ 1.34 |
-| CiteSeer | 70.35 | 60.70 (66.53) @ 2.14 | **62.60** (70.20) @ 2.55 |
-| PubMed | 78.97 | 77.70 (75.83) @ 0.82 | **78.47** (76.33) @ 0.86 |
-| Roman-Empire | 46.53 | 33.69 (32.94) @ 0.84 | **49.55** (53.84) @ 0.90 |
-| Amazon-Ratings | 47.92 | **46.73** (46.68) @ 0.53 | 46.51 (47.28) @ 0.47 |
-| City-Networks Paris | 24.18 | **27.35** (33.89) @ 0.46 | 26.78 (33.44) @ 0.48 |
+| Cora | 81.67 | 78.13 (78.67) @ 2.47 | **79.33** (80.23) @ 2.39 |
+| CiteSeer | 70.35 | 60.70 (66.53) @ 3.04 | **62.60** (70.20) @ 3.42 |
+| PubMed | 78.97 | 77.70 (75.83) @ 2.01 | **78.47** (76.33) @ 2.01 |
+| Roman-Empire | 46.53 | 33.69 (32.94) @ 2.55 | **49.55** (53.84) @ 2.97 |
+| Amazon-Ratings | 47.92 | **46.73** (46.68) @ 2.14 | 46.51 (47.28) @ 2.13 |
+| City-Networks Paris | 24.18 | **27.35** (33.89) @ 2.00 | 26.78 (33.44) @ 2.00 |
 
 - The residual is what makes 4 layers trainable. Roman-Empire, heterophilic, is the clear win:
   the 4-layer residual model beats the 2-layer one. On MEGA's citation graphs depth does not
@@ -218,10 +230,13 @@ FP32 test %, the same 200 epochs (QAT would add the quantization confound):
    - pre is better on Paris and at 8 layers on CiteSeer and PubMed.
    - At 3–4 layers they are within about 1 point; post is ahead on Roman-Empire, CiteSeer and
      PubMed at 4 layers.
-   - **Post needs more bits:** sparse avg 0.61 vs 0.47 (Amazon-Ratings, 4 layers), 1.31 vs 0.90
-     (Roman-Empire), 0.62 vs 0.48 (Paris). ReLU(·) + X only adds non-negative terms, so the
-     values grow layer by layer and need a wider range.
-   - In hardware the bits cost memory and DRAM traffic. post is not a free win.
+   - **Post stores more non-zeros, not wider values.** Bits/nz are the same (Amazon-Ratings,
+     4 layers: 2.17 post vs 2.13 pre; Roman-Empire 2.94 vs 2.97; Paris 2.00 vs 2.00), but
+     post's hidden inputs are denser (28% vs 22%, 44% vs 30%, 31% vs 24%). ReLU(·) + X keeps
+     every non-zero of X, whereas pre lets the ReLU zero some of them. (An earlier version of
+     this note read the higher *sparse* average as "post needs a wider range"; with bits/nz
+     that explanation does not hold.)
+   - In hardware the extra non-zeros cost memory and DRAM traffic. post is not a free win.
 6. **Under-training.** Roman-Empire, Amazon-Ratings and Paris peak at epochs 134–198 at 8–16
    layers, so those deep numbers are lower bounds. Follow-up with 600 FP32 epochs:
 
@@ -259,19 +274,19 @@ Evaluate them only if depth is a goal for the design.
 
 ### Q3. Why quantization loses more at depth: the memory penalty, mostly
 
-4 layers, QAT test % (FP32 in brackets); λ = 0 removes the memory penalty:
+4 layers, QAT test % (bits/nz in brackets); λ = 0 removes the memory penalty:
 
 | Dataset, form | FP32 | QAT λ = 0 (bits) | QAT recipe λ (bits) |
 |---|---|---|---|
-| CiteSeer plain | 66.53 | 64.30 (4.11) | 60.70 (2.14) |
-| CiteSeer pre | 70.20 | 66.77 (4.48) | 62.60 (2.55) |
-| Roman-Empire plain | 32.94 | 33.38 (1.89) | 33.69 (0.84) |
-| Roman-Empire pre | 53.84 | **53.84** (1.88) | 49.55 (0.90) |
-| Paris plain | 33.92 | 30.82 (1.18) | 27.35 (0.46) |
-| Paris pre | 33.57 | 29.76 (1.22) | 26.78 (0.48) |
-| Cora pre | 80.23 | 79.23 (3.72) | 79.33 (1.34) |
-| PubMed pre | 76.33 | 77.13 (3.22) | 78.47 (0.86) |
-| Amazon-Ratings pre | 47.28 | 47.18 (1.37) | 46.51 (0.47) |
+| CiteSeer plain | 66.53 | 64.30 (4.93) | 60.70 (3.04) |
+| CiteSeer pre | 70.20 | 66.77 (5.08) | 62.60 (3.42) |
+| Roman-Empire plain | 32.94 | 33.38 (4.63) | 33.69 (2.55) |
+| Roman-Empire pre | 53.84 | **53.84** (5.00) | 49.55 (2.97) |
+| Paris plain | 33.92 | 30.82 (4.23) | 27.35 (2.00) |
+| Paris pre | 33.57 | 29.76 (4.58) | 26.78 (2.00) |
+| Cora pre | 80.23 | 79.23 (4.77) | 79.33 (2.39) |
+| PubMed pre | 76.33 | 77.13 (4.63) | 78.47 (2.01) |
+| Amazon-Ratings pre | 47.28 | 47.18 (4.99) | 46.51 (2.13) |
 
 - **The penalty causes most of the extra loss.** Removing it:
   - Roman-Empire: residual QAT equals FP32 (53.84), so all 4.3 points were the penalty.
@@ -284,31 +299,31 @@ Evaluate them only if depth is a goal for the design.
   - The penalty λ(M − M_target)² keeps pushing every layer down; its gradient is
     2λ(M − M_target).
   - A 4-layer model has 3 hidden inputs instead of 1, so M − M_target, and the push, is larger.
-  - Every layer of Paris, PubMed and Amazon-Ratings ends at 2.00 bits.
+  - Paris and PubMed end at the 2.00-bit floor (bits/nz 2.00–2.01), Amazon-Ratings at 2.13.
 - **What remains at λ = 0 is real quantization error,** and it is larger at depth on CiteSeer
   (3.4 points) and Paris (3.1–3.8). At 2 layers Paris loses 0.6.
   - Errors compound through more quantized layers.
   - B̄ is 4 bits (MEGA): 20–45% of B̄ entries round to zero on these layers (`L*_b_lost_all`).
 - **Answer: yes, λ should be set per depth.** The recipe λ was tuned for 2 layers.
 
-**λ sweep at 4 layers** (`runs/resstudy2`; QAT test %, sparse avg bits in brackets; FP32 from
+**λ sweep at 4 layers** (`runs/resstudy2`; QAT test %, bits/nz in brackets; FP32 from
 the shared cache):
 
 | Dataset, form (FP32) | λ = 0 | 1e-9 | 1e-8 | 1e-7 | 1e-6 |
 |---|---|---|---|---|---|
-| CiteSeer pre (70.20) | 66.77 (4.48) | – | 65.90 (4.00) | 64.13 (3.36) | 62.60 (2.55) ← recipe |
-| Roman-Empire pre (53.84) | 53.84 (1.88) | **54.12** (1.83) | 52.21 (1.29) | 49.55 (0.90) ← recipe | – |
-| Paris plain (33.92) | 30.82 (1.18) | – | **28.41 (0.47)** | 27.35 (0.46) ← recipe | – |
+| CiteSeer pre (70.20) | 66.77 (5.08) | – | 65.90 (4.61) | 64.13 (4.03) | 62.60 (3.42) ← recipe |
+| Roman-Empire pre (53.84) | 53.84 (5.00) | **54.12** (4.93) | 52.21 (3.79) | 49.55 (2.97) ← recipe | – |
+| Paris plain (33.92) | 30.82 (4.23) | – | **28.41 (2.01)** | 27.35 (2.00) ← recipe | – |
 
 - **The trade-off is smooth on CiteSeer and Roman-Empire:** each 10× in λ costs ~1–2.5 points
-  and saves ~0.4–0.9 bits. There is no free lunch; λ picks a point on the curve.
-- **Paris λ = 1e-8 is a free win:** +1.06 points at the same 0.47 bits as the recipe. The
+  and saves ~0.5–1.1 bits per value. There is no free lunch; λ picks a point on the curve.
+- **Paris λ = 1e-8 is a free win:** +1.06 points at the same 2.0 bits (the floor) as the recipe. The
   recipe λ over-pushes Paris 4 layers; 1e-8 reaches the same floor more gently.
 - λ ≤ 1e-9 is effectively λ = 0 (same bits, same accuracy).
 - **Implication for comparisons:** a depth's accuracy and its bits must be read together.
   Comparing 2- vs 4-layer (or plain vs residual) at one λ mixes the depth effect with a
   different point on the accuracy/memory curve. Better options: match bits (choose λ per
-  configuration to hit a common sparse avg), or normalize the penalty per layer, e.g.
+  configuration to hit a common bits/nz or memory), or normalize the penalty per layer, e.g.
   λ·Σₗ(Mₗ − Mₗ,target)² / (L − 1). Not implemented yet.
 
 ### Q4. Training time
@@ -494,35 +509,37 @@ First epoch at which val reaches **0.99 × the plain model's best val at the sam
 Same recipe as the rest of the study (`--target-dense-bits 2.0`, λ = 1e-7, FP32 models from
 the screening cache, so the FP32 column equals the screening table). Runs in `runs/res5q`;
 `python -m mega_pt.res_table runs/res5q`. QAT = quantized test score (% ROC-AUC, or %
-accuracy for Roman-Empire); bits = average bits per sparse feature.
+accuracy for Roman-Empire); bits = bits/nz (floor 2.00).
 
 | Dataset, model | 2 layers QAT (bits) | 4 plain QAT (bits) | 4 residual QAT (bits) | residual FP32 → QAT |
 |---|---|---|---|---|
-| Minesweeper GCN | 72.06 (1.03) | 69.35 (0.89) | **75.58** (0.81) | 78.14 → 75.58 |
-| Minesweeper GraphSage | 71.97 (0.93) | 67.89 (0.56) | **74.94** (0.50) | 77.44 → 74.94 |
-| Tolokers GCN | 68.07 (0.89) | 63.82 (0.53) | **69.91** (0.87) | 72.59 → 69.91 |
-| Tolokers GraphSage | 72.64 (0.91) | 71.45 (0.43) | **73.71** (0.46) | 74.35 → 73.71 |
-| Questions GCN | **60.90** (0.39) | 53.84 (0.62) | 58.72 (0.59) | 64.07 → 58.72 |
-| Questions GraphSage | **75.46** (0.70) | 63.93 ± 4.06 (0.53) | 71.89 (0.71) | 74.23 → 71.89 |
-| Roman-Empire GraphSage | **45.81** (1.04) | 33.06 (0.51) | 44.29 (0.47) | 50.95 → 44.29 |
-| Roman-Empire GCN (earlier runs) | 46.29 (1.42), 1 seed, `runs/ext` | 33.69 (0.84) | **49.55** (0.90) | 53.84 → 49.55 |
+| Minesweeper GCN | 72.06 (2.99) | 69.35 (2.80) | **75.58** (2.45) | 78.14 → 75.58 |
+| Minesweeper GraphSage | 71.97 (2.67) | 67.89 (2.34) | **74.94** (2.44) | 77.44 → 74.94 |
+| Tolokers GCN | 68.07 (2.62) | 63.82 (2.33) | **69.91** (2.37) | 72.59 → 69.91 |
+| Tolokers GraphSage | 72.64 (2.58) | 71.45 (2.26) | **73.71** (2.01) | 74.35 → 73.71 |
+| Questions GCN | **60.90** (2.02) | 53.84 (2.01) | 58.72 (2.01) | 64.07 → 58.72 |
+| Questions GraphSage | **75.46** (2.00) | 63.93 ± 4.06 (2.02) | 71.89 (2.00) | 74.23 → 71.89 |
+| Roman-Empire GraphSage | **45.81** (2.58) | 33.06 (2.16) | 44.29 (2.14) | 50.95 → 44.29 |
+| Roman-Empire GCN (earlier runs) | 46.53 (3.16), `runs/ext` λ=1e-7 s0–s2 | 33.69 (2.55) | **49.55** (2.97) | 53.84 → 49.55 |
 
 Std ≤ 1.5 except where shown. Findings:
 - **Minesweeper and Tolokers keep the benefit after quantization**, for both models: the
-  4-layer residual model beats the 2-layer model by +1.1 to +3.5 points, usually at *fewer*
-  bits per feature. Roman-Empire GCN also keeps it (+3.3 points vs a single-seed 2-layer run, at fewer bits).
+  4-layer residual model beats the 2-layer model by +1.1 to +3.5 points, at fewer bits per
+  value (2.0–2.45 vs 2.6–3.0). Total memory is still higher: it stores three hidden inputs
+  instead of one. Roman-Empire GCN also keeps it (+3.0 points, 2.97 vs 3.16 bits).
 - **The residual always beats 4 plain layers after QAT** (+2 to +11 points), so it remains
   the right choice for a fixed 4-layer design.
 - **But the residual model loses more to quantization**: 0.6–6.7 points, against ≈ 0
   for the 2-layer model (which even gains on Questions/Tolokers GraphSage, a regularization
   effect). On Questions and Roman-Empire GraphSage this erases the FP32 gain.
 - **This is a λ (bit-budget) issue, not a defect of the residual.** On Roman-Empire GCN at 4
-  layers, lowering λ closes the gap completely: λ = 1e-7 → 49.55 at 0.90 bits, 1e-8 → 52.21
-  at 1.29, 1e-9 → 54.12 at 1.83 (FP32 53.84; `runs/resstudy2`). The skip path carries X̄⁽ˡ⁾
+  layers, lowering λ closes the gap completely: λ = 1e-7 → 49.55 at 2.97 bits, 1e-8 → 52.21
+  at 3.79, 1e-9 → 54.12 at 4.93 (FP32 53.84; `runs/resstudy2`). The skip path carries X̄⁽ˡ⁾
   at its own (low) bit width, so every layer re-adds its quantization error instead of
   averaging it away over neighbours. A 4-layer model at the 2-layer model's λ is
   pushed to fewer bits than the 2-layer model, so the comparison above is slightly
-  unfavourable to the residual.
+  unfavourable to the residual. The two cases that lose (Questions, Roman-Empire GraphSage)
+  sit at or near the 2-bit floor (2.00, 2.14), where λ can push no further.
 - **Next step if this matters:** compare at matched bits (pick λ per depth so the average bits
   equal the 2-layer model's), or give the skip operand its own bit-width floor. Both cost
   more memory traffic. That traffic is what R3 measures.

@@ -598,22 +598,24 @@ cycles / available.
 `--layers 4` (F → 128 → 128 → 128 → C), with and without `--residual` (layers 1 and 2), recipe
 unchanged: `--target-dense-bits 2.0`; λ: Cora 1e-5, CiteSeer and PubMed 1e-6, extra datasets 1e-7;
 `--save-model --out-dir runs/res4 --fp32-cache runs/res4/fp32_cache`. Columns: FP32 / PTQ / QAT
-test % and sparse avg bits; the 2-layer column is the QAT row of the λ-sweep / extra-datasets logs.
+test % and sparse avg bits, plus bits/nz (`avg_bits_nz`, average bits of a non-zero hidden value,
+added 2026-11-27 by `res_table.bits_nz`; the residual docs now report bits/nz); the 2-layer column
+is the QAT row of the λ-sweep / extra-datasets logs.
 
-| Dataset | Residual | FP32 | PTQ | QAT | avg bits | 2-layer QAT |
-|---|---|---|---|---|---|---|
-| Cora | no | 78.67 ± 1.72 | 77.77 ± 1.92 | 78.13 ± 0.47 | 1.32 | 81.67 |
-| Cora | yes | 80.23 ± 0.29 | 79.83 ± 0.61 | **79.33 ± 0.12** | 1.34 | |
-| CiteSeer | no | 66.53 ± 2.02 | 63.63 ± 2.53 | 60.70 ± 2.38 | 2.14 | 70.35 |
-| CiteSeer | yes | 70.20 ± 0.72 | 69.27 ± 1.03 | **62.60 ± 1.44** | 2.55 | |
-| PubMed | no | 75.83 ± 0.70 | 76.13 ± 0.49 | 77.70 ± 0.52 | 0.82 | 78.97 |
-| PubMed | yes | 76.33 ± 1.14 | 76.97 ± 1.66 | **78.47 ± 0.47** | 0.86 | |
-| Roman-Empire | no | 32.94 ± 0.63 | 31.46 ± 0.80 | 33.69 ± 0.17 | 0.84 | 46.53 |
-| Roman-Empire | yes | 53.84 ± 0.98 | 52.14 ± 1.27 | **49.55 ± 0.62** | 0.90 | |
-| Amazon-Ratings | no | 46.68 ± 0.22 | 46.33 ± 0.19 | **46.73 ± 0.11** | 0.53 | 47.92 |
-| Amazon-Ratings | yes | 47.28 ± 0.33 | 46.81 ± 0.50 | 46.51 ± 0.23 | 0.47 | |
-| Paris | no | 33.89 ± 0.11 | 22.23 ± 0.47 | **27.35 ± 0.31** | 0.46 | 24.18 |
-| Paris | yes | 33.44 ± 0.24 | 20.89 ± 1.27 | 26.78 ± 0.16 | 0.48 | |
+| Dataset | Residual | FP32 | PTQ | QAT | sparse avg bits | bits/nz | 2-layer QAT |
+|---|---|---|---|---|---|---|---|
+| Cora | no | 78.67 ± 1.72 | 77.77 ± 1.92 | 78.13 ± 0.47 | 1.32 | 2.47 | 81.67 |
+| Cora | yes | 80.23 ± 0.29 | 79.83 ± 0.61 | **79.33 ± 0.12** | 1.34 | 2.39 | |
+| CiteSeer | no | 66.53 ± 2.02 | 63.63 ± 2.53 | 60.70 ± 2.38 | 2.14 | 3.04 | 70.35 |
+| CiteSeer | yes | 70.20 ± 0.72 | 69.27 ± 1.03 | **62.60 ± 1.44** | 2.55 | 3.42 | |
+| PubMed | no | 75.83 ± 0.70 | 76.13 ± 0.49 | 77.70 ± 0.52 | 0.82 | 2.01 | 78.97 |
+| PubMed | yes | 76.33 ± 1.14 | 76.97 ± 1.66 | **78.47 ± 0.47** | 0.86 | 2.01 | |
+| Roman-Empire | no | 32.94 ± 0.63 | 31.46 ± 0.80 | 33.69 ± 0.17 | 0.84 | 2.55 | 46.53 |
+| Roman-Empire | yes | 53.84 ± 0.98 | 52.14 ± 1.27 | **49.55 ± 0.62** | 0.90 | 2.97 | |
+| Amazon-Ratings | no | 46.68 ± 0.22 | 46.33 ± 0.19 | **46.73 ± 0.11** | 0.53 | 2.14 | 47.92 |
+| Amazon-Ratings | yes | 47.28 ± 0.33 | 46.81 ± 0.50 | 46.51 ± 0.23 | 0.47 | 2.13 | |
+| Paris | no | 33.89 ± 0.11 | 22.23 ± 0.47 | **27.35 ± 0.31** | 0.46 | 2.00 | 24.18 |
+| Paris | yes | 33.44 ± 0.24 | 20.89 ± 1.27 | 26.78 ± 0.16 | 0.48 | 2.00 | |
 
 - **The residual fixes depth.** Plain 4-layer GCN loses to the 2-layer one everywhere, and
   collapses on Roman-Empire (33.7 vs 46.5). With the residual, Roman-Empire's 4-layer model
@@ -658,7 +660,7 @@ Details and tables: `docs/beyond-mega/02-residual.md`, "Residual study". Runs in
   Paris 8-layer plain 32.9 → 35.5 (ties 4 layers, 35.4). Deep models were under-trained, but
   still do not beat 4 layers; best-val epochs remain at 535–599.
 - λ sweep (4 layers): accuracy vs bits is a smooth trade-off on CiteSeer / Roman-Empire;
-  Paris λ = 1e-8 gives +1.1 points at the recipe's 0.47 bits. λ should be chosen per depth
+  Paris λ = 1e-8 gives +1.1 points at the recipe's bits (0.47 sparse avg = the 2.0 bits/nz floor). λ should be chosen per depth
   (or bits-matched) before comparing depths.
 
 ### 2026-11-27 — Residual benefit study: new datasets, GIN/GraphSage, convergence, QAT

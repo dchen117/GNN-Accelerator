@@ -358,7 +358,7 @@ def main(argv=None):
         per_seed.append(row)
         print(f"seed {seed}: " + ", ".join(
             f"{k}={v:.4f}" if isinstance(v, float) else f"{k}={v}" for k, v in row.items()
-            if k in ("fp32_test", "ptq_test", "q_test", "avg_bits_sparse", "avg_bits_dense_all",
+            if k in ("fp32_test", "ptq_test", "q_test", "avg_bits_nz", "avg_bits_sparse", "avg_bits_dense_all",
                      "cr_sparse", "seconds", "fp32_seconds", "qat_seconds", "fp32_best_epoch") or "psum_max" in k or "lost_topdeg" in k))
 
     summary = {}
@@ -374,7 +374,7 @@ def main(argv=None):
         json.dump({"args": vars(args), "m_target_kb": m_target, "summary": summary, "per_seed": per_seed}, f, indent=1)
 
     print(f"\n== {name} ({args.seeds} seeds) -> {out_dir}/results.json")
-    for k in ("fp32_test", "ptq_test", "q_test", "avg_bits_sparse", "cr_sparse",
+    for k in ("fp32_test", "ptq_test", "q_test", "avg_bits_nz", "avg_bits_sparse", "cr_sparse",
               "avg_bits_dense_all", "memory_kb_eq4"):
         if k in summary:
             s = summary[k]

@@ -2,8 +2,9 @@
 
 Collects every results.json (fold norm) under the given directories and prints, per
 (dataset, model):
-  depth × form (plain / pre / post) × λ × phase → FP32 test, QAT test, avg bits,
-  FP32 best epoch, FP32 / QAT seconds per epoch.
+  depth × form (plain / pre / post) × λ × phase → FP32 test, QAT test, bits/nz (average bits
+  of a non-zero hidden-layer value, metrics.avg_bits_nz), hidden density, the old sparse
+  average (bits/nz × density), FP32 best epoch, FP32 / QAT seconds per epoch.
 Form names: plain = no residual; pre = ReLU(ÃXW + X); post = ReLU(ÃXW) + X.
 Values are % accuracy, or % ROC-AUC for Minesweeper / Tolokers / Questions (Graph.metric).
 
@@ -39,13 +40,42 @@ def fmt(s: dict, k: str, scale: float = 1.0, nd: int = 2) -> str:
     return f"{m:.{nd}f} ± {sd:.{nd}f}"
 
 
+def bits_nz(r: dict) -> float | None:
+    """avg_bits_nz of one per-seed row; recomputed for results.json files written before it
+    existed: avg_bits_sparse = Σ nnz·b / Σ N·F and all hidden inputs have the same F, so
+    avg_bits_nz = avg_bits_sparse / mean_l(L<l>_density) over hidden inputs l ≥ 1 (checked
+    against quant_report on saved models, 2026-11-27)."""
+    if "avg_bits_nz" in r:
+        return r["avg_bits_nz"]
+    dens = [r[k] for k in sorted(r) if k.startswith("L") and k.endswith("_density") and k != "L0_density"]
+    if "avg_bits_sparse" not in r or not dens:
+        return None
+    return r["avg_bits_sparse"] / statistics.fmean(dens)
+
+
+def hid_density(r: dict) -> float | None:
+    dens = [r[k] for k in sorted(r) if k.startswith("L") and k.endswith("_density") and k != "L0_density"]
+    return statistics.fmean(dens) if dens else None
+
+
+def _ms(vals):
+    vals = [v for v in vals if v is not None]
+    if not vals:
+        return None
+    return {"mean": statistics.fmean(vals), "std": statistics.stdev(vals) if len(vals) > 1 else 0.0}
+
+
 def collect(dirs: list[str]) -> dict:
     """{(dataset, model): {(L, form, lam, phase): (summary, n_seeds, run_dir, args, per_seed)}}"""
     rows = defaultdict(dict)
     for d in dirs:
         for p in glob.glob(os.path.join(d, "**", "results.json"), recursive=True):
             r = json.load(open(p))
-            a, s = r["args"], r["summary"]
+            a, s = r["args"], dict(r["summary"])
+            for k, fn in (("avg_bits_nz", bits_nz), ("hid_density", hid_density)):
+                m = _ms([fn(row) for row in r["per_seed"]])
+                if m:
+                    s[k] = m
             if a.get("norm") != "fold":
                 continue
             phase = "fp32" if a.get("fp32_only") else "qat"
@@ -65,8 +95,8 @@ def _order(k):
 def print_tables(rows):
     for ds, model in sorted(rows):
         print(f"\n## {ds} / {model}")
-        print("| L | form | λ | phase | seeds | FP32 | QAT | avg bits | FP32 best ep | s/ep FP32 | s/ep QAT | run |")
-        print("|---|---|---|---|---|---|---|---|---|---|---|---|")
+        print("| L | form | λ | phase | seeds | FP32 | QAT | bits/nz | density | old sparse avg | FP32 best ep | s/ep FP32 | s/ep QAT | run |")
+        print("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
         for key in sorted(rows[(ds, model)], key=_order):
             s, n, run, a, _ = rows[(ds, model)][key]
             L, f, lam, phase = key
@@ -76,7 +106,8 @@ def print_tables(rows):
                      if "qat_seconds" in s else "–")
             best = f"{s['fp32_best_epoch']['mean']:.0f}" if s.get("fp32_best_epoch", {}).get("mean", -1) >= 0 else "–"
             print(f"| {L} | {f} | {lam:g} | {phase} | {n} | {fmt(s, 'fp32_test', 100)} | "
-                  f"{fmt(s, 'q_test', 100)} | {fmt(s, 'avg_bits_sparse')} | {best} | {spe_f} | {spe_q} | "
+                  f"{fmt(s, 'q_test', 100)} | {fmt(s, 'avg_bits_nz')} | {fmt(s, 'hid_density', 100, 0)}% | "
+                  f"{fmt(s, 'avg_bits_sparse')} | {best} | {spe_f} | {spe_q} | "
                   f"{os.path.relpath(run)} |")
 
 
