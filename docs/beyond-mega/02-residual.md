@@ -544,6 +544,62 @@ Std ≤ 1.5 except where shown. Findings:
   equal the 2-layer model's), or give the skip operand its own bit-width floor. Both cost
   more memory traffic. That traffic is what R3 measures.
 
+### Minimum bits for FP32-comparable accuracy (2026-11-27)
+
+**Question (user).** Memory is not the constraint; each quantized model may use what it
+needs, but as little as possible. At the *lowest* bits/nz where QAT is comparable to FP32,
+does the 4-layer residual model still beat the 2-layer one, and what does it cost in bits?
+
+**Method.**
+- "Comparable" = mean QAT ≥ mean FP32 − 1 point (our choice; all runs are saved, so a
+  different tolerance is a re-print: `python -m mega_pt.res_table --minbits runs/res5q runs/minbits`).
+- Each model gets reachable memory targets of its own size, `--target-dense-bits` 2.5 / 3.0,
+  then 3.5 / 4.0 only where 3.0 was not enough, with λ = 300 / M_target² (computed in the job
+  script; it pins M to the target as λ = 1e-5 did for Roman-Empire, "λ vs M_target" below).
+  Plus the floor recipe (target 2.0, λ = 1e-7: `runs/res5q`, Roman-Empire GCN in
+  `runs/minbits`). The minimum is the lowest bits/nz over all of these that passes.
+- Same FP32 models for every run of a row (screening cache `runs/res5/fp32_cache`). 3 seeds.
+  Runs: `runs/minbits` (scratchpad `minbits.sh`, `minbits_jobs.txt`, `minbits2_jobs.txt`).
+  Eleven 4-layer runs at 2.5 come from an aborted matched-memory batch with the identical
+  setting, tagged `target_dense_bits = 2.5` in their results.json after checking M_target.
+
+**Result.** QAT @ minimum bits/nz (FP32 in brackets). "not reached" = never within 1 point
+up to 4 dense bits; the best value is shown.
+
+| Dataset, model | 2 layers | 4 plain | 4 residual | residual − 2-layer |
+|---|---|---|---|---|
+| Minesweeper GCN | 72.07 @ 2.00 (72.18) | 69.35 @ 2.80 (69.66) | **77.91 @ 3.00** (78.14) | +5.8 pts, +1.0 bit |
+| Minesweeper GraphSage | 72.17 @ 2.00 (72.18) | 69.39 @ 3.00 (69.72) | **77.96 @ 3.00** (77.44) | +5.8 pts, +1.0 bit |
+| Tolokers GCN | 68.07 @ 2.62 (67.55) | not reached: 66.37 @ 3.92 (67.59) | **71.93 @ 3.69** (72.59) | +3.9 pts, +1.1 bit |
+| Tolokers GraphSage | 71.97 @ 2.00 (71.78) | 71.45 @ 2.26 (71.82) | **73.71 @ 2.01** (74.35) | +1.7 pts, +0.0 bit |
+| Questions GCN | not reached: 62.15 @ 4.01 (64.35) | 59.48 @ 3.00 (59.14) | **64.09 @ 3.00** (64.07) | +1.9 pts vs 2-layer's best |
+| Questions GraphSage | **75.46 @ 2.00** (72.87) | 72.67 @ 3.00 (72.27) | 73.79 @ 3.00 (74.23) | −1.7 pts, +1.0 bit |
+| Roman-Empire GCN | 47.45 @ 3.00 (47.43) | 33.93 @ 2.55 (32.90) | **53.41 @ 4.00** (53.87) | +6.0 pts, +1.0 bit |
+| Roman-Empire GraphSage | 45.81 @ 2.58 (45.46) | 33.06 @ 2.16 (32.32) | **50.08 @ 3.00** (50.95) | +4.3 pts, +0.4 bit |
+
+- **Every 4-layer residual model reaches FP32-comparable accuracy,** at 2.0–4.0 bits/nz
+  (3.0 typical). Its quantization loss was a bit-budget effect, not a limit of the design.
+- **At those bits it beats the 2-layer model on 7 of 8 pairs**, by +1.7 to +6.0 points
+  (+1.9 on Questions GCN, where the 2-layer model never gets within 1 point of its FP32).
+  The exception is Questions GraphSage, where QAT *regularizes* the 2-layer model (+2.6
+  over its own FP32) past the residual model.
+- **The price is about 1 extra bit per stored value** (0–1.1), on top of storing three hidden
+  layer inputs instead of one. That memory and DRAM traffic is what R3 has to count.
+- **Without the residual, 4 layers is never worth it:** plain 4-layer models need as many
+  bits as the residual ones and score 2–20 points lower.
+
+Caveats:
+- The targets are 0.5-dense-bit steps, so a minimum is an upper bound to within ~0.5 bit.
+  Seed std is 1–2.5 points on several rows (e.g. Tolokers GCN 4 plain ± 2.3), comparable to
+  the 1-point tolerance.
+- A dense target counts X⁽⁰⁾ too, and the optimizer moves bits between X⁽⁰⁾ and the hidden
+  layers. So the same target can give different hidden bits/nz (Roman-Empire GCN 2 layers at
+  2.5: 3.00 bits/nz; Minesweeper at 2.5: 2.00). A per-layer target would control hidden bits
+  directly.
+- The floor recipe sometimes reaches a better accuracy/bits point than the reachable 2.5
+  target (e.g. Minesweeper GCN residual 75.58 @ 2.45 vs 74.32 @ 2.14). Neither is the true
+  frontier; a finer sweep would sharpen the minima.
+
 ### λ vs M_target: is lowering λ enough to buy accuracy with memory? (2026-11-27)
 
 **How the penalty works.** L = L_task + λ(M − M_target)² (Eq.(4)–(5)). M is the *dense*
@@ -586,7 +642,7 @@ FP32: 53.84.
   from growing; bits move from X⁽⁰⁾ to the hidden layers (bits/nz 4.25–4.95, above 4).
 - **Recommendation for residual work:** set M_target to the budget and λ large (1e-5 here),
   instead of tuning λ against the floor. This is also the clean way to compare configurations
-  at matched memory (the open item of the QAT section above). MEGA-baseline runs keep the
+  at a chosen bit budget (used in "Minimum bits for FP32-comparable accuracy" above). MEGA-baseline runs keep the
   floor recipe for fidelity (Q-10 / Q-13 decisions).
 - **Caveats.**
   - Eq.(4) is two-sided: a model that needs less than M_target is pushed *up* to it. A

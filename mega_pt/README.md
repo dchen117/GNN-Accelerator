@@ -686,3 +686,12 @@ screening, 102 jobs) and `runs/res5q` (QAT λ = 1e-7 + GIN lr check); tables via
   reachable target (`--target-dense-bits 3.0 --lam 1e-5`) pins M within 0.06% and gives
   53.03 ± 0.99 at 3.00 bits/nz, against 49.55 ± 0.62 at 2.97 bits/nz for the floor recipe
   (λ = 1e-7). Details: `docs/beyond-mega/02-residual.md`, "λ vs M_target".
+
+### 2026-11-27 — Minimum bits for FP32-comparable QAT (2 vs 4 layers ± residual)
+
+`runs/minbits` + `runs/res5q`; table via `python -m mega_pt.res_table --minbits runs/res5q runs/minbits`.
+Lowest bits/nz with mean QAT ≥ FP32 − 1 point over targets 2.0 (λ = 1e-7) / 2.5 / 3.0 (/ 3.5 /
+4.0), λ = 300 / M_target². Every 4-layer residual model gets there (2.0–4.0 bits/nz, ~3 typical)
+and beats the 2-layer model on 7 of 8 dataset/model pairs by +1.7 to +6.0 points, at ~1 extra bit
+per value. Exception: Questions GraphSage. Details: `docs/beyond-mega/02-residual.md`.
+
