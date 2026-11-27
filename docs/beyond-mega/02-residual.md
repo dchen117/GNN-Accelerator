@@ -416,7 +416,12 @@ model is the best configuration we have trained. What they share: Q2.
   ~deg, so after 3 layers it is ~deg³ (Amazon-Ratings: mean degree 8, Tolokers 89). The
   identity term X is then negligible next to the aggregate, so the residual cannot help.
   The published GIN uses a 2-layer MLP with batch norm per layer, which bounds the scale.
-  Check with lr 1e-3 below.
+- **Learning rate is not the cause** (`runs/res5q`, 4 layers, `--lr 1e-3` instead of 1e-2,
+  FP32, 3 seeds): Roman-Empire plain 14.82 / residual 15.10, Amazon-Ratings 36.62 / 36.64,
+  Minesweeper 67.95 / 67.96. Still at the class prior on the first two, and identical with or
+  without the residual. Making GIN benefit needs a normalized aggregation (e.g. mean over
+  A+I, or GIN-ε with a per-layer scale), which is a change to the model, not the residual.
+  Not done: GIN would no longer be MEGA's GIN, and GCN/GraphSage already make the case.
 
 ### Q2. What task are we doing, and which tasks should benefit?
 
@@ -480,7 +485,47 @@ First epoch at which val reaches **0.99 × the plain model's best val at the sam
     in hardware does not have to tune depth per dataset.
   - **Seed stability:** residual std is often lower (Cora 4 layers 0.29 vs 1.76; Tolokers
     1.01 vs 2.49).
-  - **Quantization robustness:** see the QAT table below.
+  - **Quantization robustness:** mixed. The benefit survives QAT on Minesweeper and
+    Tolokers, but the residual model loses more accuracy to quantization than the 2-layer
+    model at the same λ. See "Does the benefit survive quantization?" below.
+
+### Does the benefit survive quantization? (QAT, λ = 1e-7, 3 seeds)
+
+Same recipe as the rest of the study (`--target-dense-bits 2.0`, λ = 1e-7, FP32 models from
+the screening cache, so the FP32 column equals the screening table). Runs in `runs/res5q`;
+`python -m mega_pt.res_table runs/res5q`. QAT = quantized test score (% ROC-AUC, or %
+accuracy for Roman-Empire); bits = average bits per sparse feature.
+
+| Dataset, model | 2 layers QAT (bits) | 4 plain QAT (bits) | 4 residual QAT (bits) | residual FP32 → QAT |
+|---|---|---|---|---|
+| Minesweeper GCN | 72.06 (1.03) | 69.35 (0.89) | **75.58** (0.81) | 78.14 → 75.58 |
+| Minesweeper GraphSage | 71.97 (0.93) | 67.89 (0.56) | **74.94** (0.50) | 77.44 → 74.94 |
+| Tolokers GCN | 68.07 (0.89) | 63.82 (0.53) | **69.91** (0.87) | 72.59 → 69.91 |
+| Tolokers GraphSage | 72.64 (0.91) | 71.45 (0.43) | **73.71** (0.46) | 74.35 → 73.71 |
+| Questions GCN | **60.90** (0.39) | 53.84 (0.62) | 58.72 (0.59) | 64.07 → 58.72 |
+| Questions GraphSage | **75.46** (0.70) | 63.93 ± 4.06 (0.53) | 71.89 (0.71) | 74.23 → 71.89 |
+| Roman-Empire GraphSage | **45.81** (1.04) | 33.06 (0.51) | 44.29 (0.47) | 50.95 → 44.29 |
+| Roman-Empire GCN (earlier runs) | 46.29 (1.42), 1 seed, `runs/ext` | 33.69 (0.84) | **49.55** (0.90) | 53.84 → 49.55 |
+
+Std ≤ 1.5 except where shown. Findings:
+- **Minesweeper and Tolokers keep the benefit after quantization**, for both models: the
+  4-layer residual model beats the 2-layer model by +1.1 to +3.5 points, usually at *fewer*
+  bits per feature. Roman-Empire GCN also keeps it (+3.3 points vs a single-seed 2-layer run, at fewer bits).
+- **The residual always beats 4 plain layers after QAT** (+2 to +11 points), so it remains
+  the right choice for a fixed 4-layer design.
+- **But the residual model loses more to quantization**: 0.6–6.7 points, against ≈ 0
+  for the 2-layer model (which even gains on Questions/Tolokers GraphSage, a regularization
+  effect). On Questions and Roman-Empire GraphSage this erases the FP32 gain.
+- **This is a λ (bit-budget) issue, not a defect of the residual.** On Roman-Empire GCN at 4
+  layers, lowering λ closes the gap completely: λ = 1e-7 → 49.55 at 0.90 bits, 1e-8 → 52.21
+  at 1.29, 1e-9 → 54.12 at 1.83 (FP32 53.84; `runs/resstudy2`). The skip path carries X̄⁽ˡ⁾
+  at its own (low) bit width, so every layer re-adds its quantization error instead of
+  averaging it away over neighbours. A 4-layer model at the 2-layer model's λ is
+  pushed to fewer bits than the 2-layer model, so the comparison above is slightly
+  unfavourable to the residual.
+- **Next step if this matters:** compare at matched bits (pick λ per depth so the average bits
+  equal the 2-layer model's), or give the skip operand its own bit-width floor. Both cost
+  more memory traffic. That traffic is what R3 measures.
 
 ### Q5. How the residual is handled in software, and what the hardware receives
 

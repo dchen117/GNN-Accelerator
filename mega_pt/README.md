@@ -660,3 +660,17 @@ Details and tables: `docs/beyond-mega/02-residual.md`, "Residual study". Runs in
 - λ sweep (4 layers): accuracy vs bits is a smooth trade-off on CiteSeer / Roman-Empire;
   Paris λ = 1e-8 gives +1.1 points at the recipe's 0.47 bits. λ should be chosen per depth
   (or bits-matched) before comparing depths.
+
+### 2026-11-27 — Residual benefit study: new datasets, GIN/GraphSage, convergence, QAT
+
+Details and tables: `docs/beyond-mega/02-residual.md`, "Residual benefit study". New datasets
+Minesweeper / Tolokers / Questions (ROC-AUC, `Graph.metric`). Runs in `runs/res5` (FP32
+screening, 102 jobs) and `runs/res5q` (QAT λ = 1e-7 + GIN lr check); tables via
+`python -m mega_pt.res_table runs/res5 runs/res5q`, convergence via `--curves runs/res5`.
+- FP32: 4-layer residual is the best model on Minesweeper (GCN 78.1 vs 72.2 at 2 layers),
+  Tolokers (GCN 72.6 vs 67.6) and Roman-Empire, for GCN and GraphSage. GIN: no benefit,
+  deep GIN-0 diverges (lr 1e-3 does not fix it).
+- Convergence: at equal depth the residual reaches the plain model's best val 1.3–20× sooner.
+- QAT: the gain survives on Minesweeper / Tolokers (+1.1 to +3.5 over 2 layers), not on
+  Questions / Roman-Empire GraphSage; the residual loses 0.6–6.7 points to quantization at
+  λ = 1e-7 (fixed by a lower λ: more bits).
