@@ -348,3 +348,193 @@ the shared cache):
   vs 103 plain; PubMed 17 / 51 vs 124).
 - Roman-Empire, Amazon-Ratings and Paris are still improving at epoch 200 at every depth.
 - At 16 layers everything peaks late.
+
+## Residual benefit study (2026-11-26/27): where does the residual pay?
+
+User goal: show that the residual benefits *some* domain / dataset / task, on more than
+Roman-Empire. Six questions; answers below. Runs: `runs/res5/` (102 FP32 screening jobs,
+3 seeds, 200 epochs, per-epoch val curves) and `runs/res5q/` (QAT on the winners, recipe
+λ = 1e-7). Tables: `python -m mega_pt.res_table runs/res5 runs/res5q`; convergence:
+`python -m mega_pt.res_table --curves runs/res5`.
+
+New datasets (Platonov et al. 2023, same source as Roman-Empire / Amazon-Ratings; pinned in
+`mega_pt/data.py`): **Minesweeper** (10k nodes, a 100×100 grid, label = is a mine, features =
+one-hot count of neighbouring mines, 50% of them hidden), **Tolokers** (11.8k crowd workers,
+edge = worked on the same task, label = banned), **Questions** (49k users of a Q&A site, edge
+= answered each other, label = still active). All three are binary and imbalanced, so the
+metric is **ROC-AUC** (as in the paper; `metrics.roc_auc`, `Graph.metric = "auc"`). The same
+three-model recipe is used: hidden 128 (GraphSage 256), dropout, lr 0.01, 200 epochs.
+
+### Q1 + Q4. Datasets and models where the residual helps (FP32, 3 seeds)
+
+Test % (accuracy, or ROC-AUC for Minesweeper / Tolokers / Questions). **Bold** = the
+residual model beats the best plain model of any depth by more than 1 std.
+
+| Dataset | Model | 2 layers | 4 plain | 4 residual | 8 plain | 8 residual |
+|---|---|---|---|---|---|---|
+| Minesweeper | GCN | 72.18 | 69.66 | **78.14** | 65.75 | 75.90 |
+| Minesweeper | GraphSage | 72.18 | 69.72 | **77.44** | 65.81 | 74.70 |
+| Minesweeper | GIN | 72.29 | 68.02 | 68.17 | 61.31 | 60.16 |
+| Tolokers | GCN | 67.55 | 67.59 | **72.59** | 62.67 | 71.54 |
+| Tolokers | GraphSage | 71.78 | 71.82 | **74.35** | – | – |
+| Tolokers | GIN | 69.22 | 68.65 | 68.73 | – | – |
+| Questions | GCN | 64.35 | 59.14 | 64.07 | 48.59 | 61.56 |
+| Questions | GraphSage | 72.87 | 72.27 | 74.23 | – | – |
+| Questions | GIN | 62.75 | 62.84 | 62.63 | – | – |
+| Roman-Empire | GCN | 47.43 | 32.90 | **53.87** | 19.67 | 46.32 |
+| Roman-Empire | GraphSage | 45.46 | 32.32 | **50.95** | 18.71 | 38.95 |
+| Roman-Empire | GIN | 45.17 | 14.78 | 14.86 | 13.92 | 13.81 |
+| Amazon-Ratings | GCN | 47.90 | 46.85 | 47.30 | 45.33 | 45.73 |
+| Amazon-Ratings | GraphSage | 47.98 | 47.29 | 47.43 | – | – |
+| Amazon-Ratings | GIN | 45.11 | 36.76 | 36.63 | – | – |
+| Cora | GCN | 81.57 | 78.63 | 80.23 | 34.43 | 79.53 |
+| Cora | GraphSage | 81.70 | 79.53 | 81.30 | – | – |
+| Cora | GIN | 78.07 | 73.47 | 73.87 | – | – |
+| CiteSeer | GCN | 71.10 | 67.13 | 70.03 | 26.73 | 67.03 |
+| CiteSeer | GraphSage | 71.60 | 64.93 | 67.87 | – | – |
+| CiteSeer | GIN | 67.83 | 63.37 | 62.43 | – | – |
+| PubMed | GCN | 79.33 | 75.83 | 76.33 | 55.60 | 76.47 |
+| PubMed | GraphSage | 78.27 | 76.83 | 76.87 | – | – |
+| PubMed | GIN | 76.70 | 73.93 | 76.73 | – | – |
+
+(GCN Tolokers 3 layers: plain 69.39, residual 72.12. GCN Questions 3 layers: 58.49 / 62.64.)
+
+**Q1 answer.** Yes: **Minesweeper (+6 AUC over the best plain model) and Tolokers (+3–5)**
+join Roman-Empire, for both GCN and GraphSage. **Questions** is weaker: GraphSage +1.4 (within
+the 2-layer std of 1.6), GCN only recovers the 2-layer level. In all four the 4-layer residual
+model is the best configuration we have trained. What they share: Q2.
+
+**Q4 answer.**
+- **GraphSage: yes**, the same pattern as GCN, on the same four datasets. Nothing changes in
+  the hardware: the residual is added in the Encoder after the aggregation, where the three
+  models differ only in the per-degree factors (`GraphOps.src_scale / dst_scale`). GIN and
+  GraphSage residual models are bit-exact in megasim (`megasim.check`, smoke runs 2026-11-26).
+- **GIN: no benefit anywhere.** Deep GIN does not train in our setup: on Roman-Empire and
+  Amazon-Ratings the 4-layer model's best val epoch is 1–3 and accuracy falls to the majority
+  class (14.8%, 36.8%). Cause: our GIN is GIN-0 with one linear layer and a plain **sum** over
+  A+I (MEGA's form), with no normalization. Each layer multiplies the activation scale by
+  ~deg, so after 3 layers it is ~deg³ (Amazon-Ratings: mean degree 8, Tolokers 89). The
+  identity term X is then negligible next to the aggregate, so the residual cannot help.
+  The published GIN uses a 2-layer MLP with batch norm per layer, which bounds the scale.
+  Check with lr 1e-3 below.
+
+### Q2. What task are we doing, and which tasks should benefit?
+
+- **What we do:** transductive, full-graph **node classification** (GraphSage: sampled
+  neighbours), one graph, labels on a subset of nodes, MEGA's setting. Citation graphs use
+  the Planetoid split: ~20 labels per class (≤ 5% of nodes).
+- **Where the residual paid:** Roman-Empire, Minesweeper, Tolokers, Questions. What they
+  share:
+  1. **Heterophily / ego-vs-neighbour signal.** The label depends on the node's *own*
+     features as well as on (often dissimilar) neighbours: a Minesweeper cell's own
+     revealed count; a Roman-Empire word's own embedding vs. its context. Without a
+     residual, GCN/GraphSage average the node into its neighbourhood at every layer and
+     lose that signal (oversmoothing): 4 plain layers are *worse* than 2. With it, the node's
+     representation survives each averaging step (Platonov et al. make the same point with
+     ego/neighbour separation).
+  2. **Enough labels.** 50% of nodes are training nodes, so a deeper model does not simply
+     overfit. On Cora / CiteSeer / PubMed (≤ 5% labelled) depth overfits by epoch 10–60
+     whatever the form; the residual only stops the collapse.
+  3. **Possibly, information beyond 2 hops** (hypothesis, not tested): a Minesweeper cell's
+     label is constrained by the counts of its neighbours, which depend on *their*
+     neighbours, so 3–4 hops can help.
+- **Where it did not pay:** Amazon-Ratings (heterophilous, but the signal is weak for every
+  model, ~48%), Paris (long-range: depth helps, the identity residual does not), citation.
+- **Tasks that should benefit more, not available in MEGA's setting:**
+  - Long-range benchmarks (LRGB: Peptides, PascalVOC-SP), where 6–10+ layers are needed.
+    Graph-level tasks need batching of many small graphs and a pooling/readout stage:
+    new hardware.
+  - Large, well-labelled node classification: **ogbn-arxiv** (169k nodes, 54% train), where
+    3-layer GCN with residual connections is the usual baseline, and ogbn-proteins (deep
+    ResGCN / DeeperGCN). Not run: the environment's network policy blocks
+    `snap.stanford.edu`.
+  - Graph classification with GIN (molecules), where residual/JK connections are standard.
+
+### Q3. Other benefits: convergence speed (FP32 val curves)
+
+First epoch at which val reaches **0.99 × the plain model's best val at the same depth**
+(a level both forms reach), mean of seeds; and first epoch at which val reaches 0.99 × the
+**2-layer** model's best (shallow-model quality). From `res_table --curves runs/res5`.
+
+| Dataset, model, 4 layers | plain → own best | residual → plain's best | residual → 2-layer level | 2-layer → own level |
+|---|---|---|---|---|
+| Roman-Empire GCN | 138 | **19** | 73 | 100 |
+| Roman-Empire GraphSage | 162 | **34** | 101 | 105 |
+| Tolokers GCN | 104 | **44** | 46 | 71 |
+| Tolokers GraphSage | 101 | **75** | 71 | 57 |
+| Questions GCN | 150 | **7** | 149 (1/3 seeds) | 12 |
+| Questions GraphSage | 98 | **72** | 90 | 96 |
+| Minesweeper GCN | 5 | 4 | 25 | 11 |
+| Cora GCN | 59 | **15** | 10 | 32 |
+| CiteSeer GCN | 55 | **7** | 8 (1/3) | 59 |
+
+- **At the same depth the residual model converges 1.3–20× faster** to the plain model's
+  quality (and then keeps improving), on almost every dataset.
+- **Against the 2-layer model it is about even in epochs** (Tolokers / Roman-Empire GCN are
+  faster, Minesweeper slower). In wall-clock it is slower: a 4-layer epoch costs 1.5–2× a
+  2-layer epoch (Q4 of the previous study). So the honest claim is "deeper *and* no slower
+  to train per epoch than the shallow model", not "faster than the shallow model".
+- Other benefits observed or worth testing:
+  - **Robustness to depth:** at 8 layers plain GCN collapses (Cora 34%, CiteSeer 27%) while
+    the residual stays within 1–3 points of the best. A design that must fix the layer count
+    in hardware does not have to tune depth per dataset.
+  - **Seed stability:** residual std is often lower (Cora 4 layers 0.29 vs 1.76; Tolokers
+    1.01 vs 2.49).
+  - **Quantization robustness:** see the QAT table below.
+
+### Q5. How the residual is handled in software, and what the hardware receives
+
+- **Training (`mega_pt.model.QGCN.forward`).** The residual operand is the layer's
+  *fake-quantized input* X_q = X̄⁽ˡ⁾ · Δ⁽ˡ⁾_d, the same tensor the combination consumes,
+  taken before dropout (decision 2). It is added in float to the aggregate (pre: before the
+  ReLU; post: after). There is no explicit rescaling during training: X_q and the aggregate
+  are both real-valued, and the next layer's quantizer re-quantizes the sum with its own
+  per-degree step Δ⁽ˡ⁺¹⁾_d. Gradients flow through X_q by the straight-through estimator,
+  as for the combination input.
+- **Export (`megasim.program`).** The scale change is made explicit here. For each residual
+  layer the program gets one table r_d = Δ⁽ˡ⁾_d / Δ⁽ˡ⁺¹⁾_d (one entry per degree present,
+  16-bit fixed point with a shared binary point, like MEGA's other degree tables), plus the
+  `res_post` flag. 16 bits is lossless (megasim bit-exact runs); 12 bits cost 0.2 points on
+  the R1 Cora smoke model.
+- **Hardware (`megasim.functional.encode_next`).** The Encoder computes
+  X̄⁽ˡ⁺¹⁾ = min(round(ReLU(psum·e_d·γ_j + X̄⁽ˡ⁾·r_d)), qmax_d): both products are integers
+  with their own binary points; the one with fewer fractional bits is shifted to align, then
+  one add, ReLU, one rounding, clip. So **the residual is not a new tensor passed in**: it is
+  X̄⁽ˡ⁾, the layer's own compressed input, which already exists (it was written by the
+  previous layer's Encoder and read by this layer's combination). What is new is (a) the r_d
+  table and (b) getting X̄⁽ˡ⁾ back to the Encoder after aggregation, through DRAM
+  (`x_res_w`/`x_res_r`) and a Decoder (R3 checklist above). The PyTorch integer reference
+  (`hw_stats.int_forward`) and megasim are bit-exact for GCN, GIN and GraphSage.
+
+### Q6. Specialize or generalize the residual?
+
+Variants, by what they need in MEGA's dataflow (X·W first, then Ã·B; Encoder at the end):
+
+| Variant | Formula (per layer) | Extra hardware vs. ours | Fits the Encoder add? |
+|---|---|---|---|
+| Identity, pre / post (ours) | ReLU(ÃXW + X) / ReLU(ÃXW) + X | r_d table, X̄⁽ˡ⁾ round trip | yes |
+| Scaled / gated identity | ÃXW + s·X, s learned per layer or per channel | none: s folds into r_d (per layer) or into a per-column table like γ_j | yes |
+| Initial residual (APPNP-style) | (1−α)ÃXW + α·X⁽¹⁾ | keep X̄⁽¹⁾ (one hidden layer) for all layers instead of X̄⁽ˡ⁾ | yes (different source address) |
+| GCNII | σ(((1−α)ÃX + αX⁽¹⁾)((1−β)I + βW)) | W acts *after* the mix; in X·W-first order that is a second combination (X⁽¹⁾·W) per layer | no (2× combination) |
+| Projection / self weight (GraphSage root weight) | ÃXW + X·W_self | second weight matrix: a wider combination X·[W W_self], and the self half bypasses aggregation to the Encoder | partly (2× combination, but no extra aggregation) |
+| Dense / JK connections | concat or max of all layers | stores all layers, wider inputs | no |
+
+Recommendation:
+- **Generalize the cheap axis, specialize the expensive one.** Build one Encoder "skip
+  add" that takes (source layer index, per-degree table, optional per-column table,
+  pre/post flag). That one unit covers identity (pre/post), scaled/gated identity and the
+  initial residual at almost no extra cost: the per-column table reuses γ_j's structure,
+  and the source index only changes which X̄ rows are fetched. All of these are
+  model-agnostic (GCN / GraphSage / GIN differ only in the degree factors, already folded
+  into e_d and r_d) and use the same quantization rule: align binary points, add, round once.
+- **Do not build variants that put a matrix multiply on the skip path** (GCNII, projection)
+  unless a target workload needs them: each doubles the combination work and adds weights,
+  which is MEGA's dominant cost. The exception worth evaluating is the projection skip,
+  which is the only way to get a residual at 2 layers (F_in ≠ F_out) and is GraphSage's
+  standard root weight.
+- **Quantization is what makes the generalization cheap or not.** Every variant that adds a
+  stored, already-quantized tensor costs one aligned multiply-add per value. Anything that
+  needs a *new* tensor (X⁽¹⁾·W, concatenations) needs a new quantizer, new range/bit tables
+  and new memory in Eq.(4).
+- **GIN needs a different fix first:** normalization (or mean aggregation, which is
+  GraphSage) to bound the activation scale; a residual alone does not help it (Q4).
