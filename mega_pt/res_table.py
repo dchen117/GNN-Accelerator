@@ -10,6 +10,7 @@ Values are % accuracy, or % ROC-AUC for Minesweeper / Tolokers / Questions (Grap
 
     python -m mega_pt.res_table runs/res4 runs/resstudy runs/res5
     python -m mega_pt.res_table --curves runs/res5      # epochs-to-threshold, plain vs residual
+    python -m mega_pt.res_table --minbits runs/res5q runs/minbits   # min bits within 1 pt of FP32
 
 --curves (needs fp32_val_curve, recorded since 2026-11-26): for each (dataset, model, L) with
 both a plain and a residual run, the threshold is thr = 0.99 × min(best val of the two), a
@@ -152,10 +153,52 @@ def print_curves(rows):
                 print(f"| {ds} | {model} | {L} | {f} | {100 * best[f]:.2f} | {_mean_reach(ps, thr)} | {r2} |")
 
 
+def print_minbits(dirs, tol=1.0):
+    """Minimum-bits study (2026-11-27). For each (dataset, model, L, form): QAT @ bits/nz at
+    every memory target found (--target-dense-bits; 'floor' = the 2-bit-floor recipe runs,
+    e.g. runs/res5q at λ = 1e-7), and the lowest bits/nz whose mean QAT is within `tol`
+    points of the mean FP32 ('–' if none)."""
+    grp = defaultdict(dict)
+    fp32 = {}
+    for d in dirs:
+        for p in glob.glob(os.path.join(d, "**", "results.json"), recursive=True):
+            r = json.load(open(p))
+            a, s = r["args"], r["summary"]
+            if "q_test" not in s or a.get("norm") != "fold":
+                continue
+            tb = a.get("target_dense_bits")
+            reach = r["m_target_kb"] > 0 and tb is not None and tb > 2.0
+            level = tb if reach else "floor"
+            k = (a["dataset"], a.get("model", "gcn"), a.get("layers", 2), form(a))
+            nz = _ms([bits_nz(x) for x in r["per_seed"]])
+            grp[k][level] = (100 * s["q_test"]["mean"], 100 * s["q_test"]["std"], nz["mean"])
+            fp32[k] = 100 * s["fp32_test"]["mean"]
+    levels = sorted({lv for g in grp.values() for lv in g if lv != "floor"})
+    cols = ["floor"] + levels
+    print(f"QAT @ bits/nz per memory target (dense bits); 'min' = lowest bits/nz within {tol} pt of FP32")
+    print("| dataset | model | L | form | FP32 | " + " | ".join(str(c) for c in cols) + " | min bits/nz | QAT − FP32 there |")
+    print("|---|---|---|---|---|" + "---|" * len(cols) + "---|---|")
+    for k in sorted(grp, key=lambda k: (k[0], k[1], k[2], ["plain", "pre", "post"].index(k[3]))):
+        cells, ok = [], []
+        for c in cols:
+            v = grp[k].get(c)
+            if v is None:
+                cells.append("–")
+                continue
+            cells.append(f"{v[0]:.2f} ± {v[1]:.2f} @ {v[2]:.2f}")
+            if v[0] >= fp32[k] - tol:
+                ok.append((v[2], v[0] - fp32[k]))
+        best = min(ok) if ok else None
+        tail = f"**{best[0]:.2f}** | {best[1]:+.2f}" if best else "– | –"
+        print(f"| {k[0]} | {k[1]} | {k[2]} | {k[3]} | {fp32[k]:.2f} | " + " | ".join(cells) + f" | {tail} |")
+
+
 def main(argv=None):
     argv = list(argv if argv is not None else sys.argv[1:])
     curves = "--curves" in argv
-    dirs = [a for a in argv if a != "--curves"] or ["runs/res4", "runs/resstudy"]
+    dirs = [a for a in argv if not a.startswith("--")] or ["runs/res4", "runs/resstudy"]
+    if "--minbits" in argv:
+        return print_minbits(dirs)
     rows = collect(dirs)
     print_curves(rows) if curves else print_tables(rows)
 
