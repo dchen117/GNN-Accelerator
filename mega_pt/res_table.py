@@ -106,6 +106,9 @@ def print_curves(rows):
                       if k[3] == "fp32" and all("fp32_val_curve" in r for r in v[4])}
         l2 = with_curve.get((2, "plain", 0.0, "fp32"))
         thr2 = 0.99 * statistics.fmean(max(r["fp32_val_curve"]) for r in l2[4]) if l2 else None
+        if l2:                                       # reference: the 2-layer model itself
+            b2 = statistics.fmean(max(r["fp32_val_curve"]) for r in l2[4])
+            print(f"| {ds} | {model} | 2 | plain | {100 * b2:.2f} | – | {_mean_reach(l2[4], thr2)} |")
         for L in sorted({k[0] for k in with_curve if k[0] > 2}):
             forms = {k[1]: v for k, v in with_curve.items() if k[0] == L}
             if "plain" not in forms or len(forms) < 2:
