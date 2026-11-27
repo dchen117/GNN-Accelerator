@@ -544,6 +544,61 @@ Std ≤ 1.5 except where shown. Findings:
   equal the 2-layer model's), or give the skip operand its own bit-width floor. Both cost
   more memory traffic. That traffic is what R3 measures.
 
+### λ vs M_target: is lowering λ enough to buy accuracy with memory? (2026-11-27)
+
+**How the penalty works.** L = L_task + λ(M − M_target)² (Eq.(4)–(5)). M is the *dense*
+memory with continuous b over every layer input, X⁽⁰⁾ included (`QGCN.memory_kb`). Its
+gradient on a bit width is 2λ(M − M_target)·(rows × dim)/η. Our recipe sets M_target at the
+2-bit dense floor (`--target-dense-bits 2.0`), and b ≥ 2, so **M > M_target always**. The
+penalty never reaches zero; it pushes every bit width down for all 200 QAT epochs, and λ only
+sets how hard. The end point is wherever the push and the task gradient balance, or wherever
+training stops, which is not a memory level anyone chose.
+
+So yes: with the floor target, lowering λ alone *does* trade memory for accuracy (the λ sweep
+above). But the memory you get is only known after training, and the trade is poor. The
+alternative is a **reachable target**: set M_target to the memory you are willing to pay and
+use a λ large enough to act as a constraint. Then M settles at the target, and the task loss
+decides how to spread the bits over layers and degrees at that fixed total.
+
+**Check** (Roman-Empire GCN, 4 layers, pre residual, 3 seeds, same FP32 models; `runs/mtgt`,
+scratchpad `mtgt.sh`). Bits = bits/nz; M = Eq.(4) memory at the end of QAT.
+
+| M_target | λ | M end / target | QAT | bits/nz | old sparse avg |
+|---|---|---|---|---|---|
+| 2-bit floor (recipe) | 1e-7 | 3784 target, never reached | 49.55 ± 0.62 | 2.97 | 0.90 |
+| 2-bit floor | 1e-8 | never reached | 52.21 ± 1.03 | 3.79 | 1.29 |
+| 2-bit floor | 1e-9 | never reached | 54.12 ± 0.96 | 4.93 | 1.83 |
+| **3 dense bits** (5677 KB) | 1e-5 | 5680 (+0.06%) | **53.03 ± 0.99** | **3.00** | 0.96 |
+| 3 dense bits | 1e-6 | 5708 (+0.6%) | 52.50 ± 0.88 | 3.14 | 1.01 |
+| 4 dense bits (7569 KB) | 1e-5 | 7570 | 53.56 ± 0.68 | 4.25 | 1.54 |
+| 4 dense bits | 1e-6 | 7571 | 53.84 ± 0.69 | 4.95 | 1.82 |
+
+FP32: 53.84.
+
+- **A reachable target pins the memory.** At λ = 1e-5, M ends within 0.06% of M_target on
+  every seed; at 1e-6, within 0.6%.
+- **It is a much better trade at the same bits.** At ~3.0 bits/nz the reachable target gives
+  53.03 against 49.55 for the floor target with λ = 1e-7: +3.5 points for the same memory.
+  It also beats floor-target λ = 1e-8 (52.21) while using 0.8 fewer bits per value. A
+  constant downward push takes bits from every layer and degree alike. A budget lets the task
+  loss move bits to where they matter.
+- 4 dense bits is the starting point (all b initialized at 4), so that target only stops M
+  from growing; bits move from X⁽⁰⁾ to the hidden layers (bits/nz 4.25–4.95, above 4).
+- **Recommendation for residual work:** set M_target to the budget and λ large (1e-5 here),
+  instead of tuning λ against the floor. This is also the clean way to compare configurations
+  at matched memory (the open item of the QAT section above). MEGA-baseline runs keep the
+  floor recipe for fidelity (Q-10 / Q-13 decisions).
+- **Caveats.**
+  - Eq.(4) is two-sided: a model that needs less than M_target is pushed *up* to it. A
+    one-sided hinge, λ·max(0, M − M_target)², would avoid spending unneeded memory. Not
+    implemented.
+  - M_target is a dense total over all layer inputs, X⁽⁰⁾ included. It is not a bits/nz
+    target: "3 dense bits" gave 3.00 bits/nz here by coincidence, and the bits can shift
+    between X⁽⁰⁾ and hidden layers. A per-layer target would control hidden storage directly.
+  - λ's scale depends on the memory in KB (dataset size). Normalizing the penalty, e.g.
+    λ·((M − M_target)/M_target)², would make one λ work across datasets. Not implemented.
+  - One dataset and one model so far.
+
 ### Q5. How the residual is handled in software, and what the hardware receives
 
 - **Training (`mega_pt.model.QGCN.forward`).** The residual operand is the layer's

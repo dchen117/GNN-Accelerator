@@ -676,3 +676,13 @@ screening, 102 jobs) and `runs/res5q` (QAT λ = 1e-7 + GIN lr check); tables via
 - QAT: the gain survives on Minesweeper / Tolokers (+1.1 to +3.5 over 2 layers), not on
   Questions / Roman-Empire GraphSage; the residual loses 0.6–6.7 points to quantization at
   λ = 1e-7 (fixed by a lower λ: more bits).
+
+### 2026-11-27 — bits/nz metric; λ vs a reachable M_target
+
+- New metric `avg_bits_nz` (bits of a non-zero hidden value; `quant_report`, recomputed for old
+  runs by `res_table.bits_nz`). The residual docs now report it instead of the sparse average.
+- λ vs M_target (`runs/mtgt`, Roman-Empire GCN, 4 layers, pre residual, 3 seeds): with
+  M_target at the 2-bit floor the penalty never reaches zero and λ only sets the push. A
+  reachable target (`--target-dense-bits 3.0 --lam 1e-5`) pins M within 0.06% and gives
+  53.03 ± 0.99 at 3.00 bits/nz, against 49.55 ± 0.62 at 2.97 bits/nz for the floor recipe
+  (λ = 1e-7). Details: `docs/beyond-mega/02-residual.md`, "λ vs M_target".
