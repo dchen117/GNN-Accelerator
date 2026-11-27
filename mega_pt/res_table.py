@@ -10,7 +10,6 @@ Values are % accuracy, or % ROC-AUC for Minesweeper / Tolokers / Questions (Grap
 
     python -m mega_pt.res_table runs/res4 runs/resstudy runs/res5
     python -m mega_pt.res_table --curves runs/res5      # epochs-to-threshold, plain vs residual
-    python -m mega_pt.res_table --matched runs/matched  # equal-memory comparison, by M_target
 
 --curves (needs fp32_val_curve, recorded since 2026-11-26): for each (dataset, model, L) with
 both a plain and a residual run, the threshold is thr = 0.99 × min(best val of the two), a
@@ -153,42 +152,10 @@ def print_curves(rows):
                 print(f"| {ds} | {model} | {L} | {f} | {100 * best[f]:.2f} | {_mean_reach(ps, thr)} | {r2} |")
 
 
-def print_matched(dirs):
-    """Matched-memory runs (2026-11-27): rows = (dataset, model, M_target); columns = 2-layer,
-    4-layer plain, 4-layer residual, each 'QAT @ bits/nz', plus the worst M_end / M_target
-    (memory_kb_eq4, Eq.(4) with continuous b) over the three, to show the budget held."""
-    grp = defaultdict(dict)
-    for d in dirs:
-        for p in glob.glob(os.path.join(d, "**", "results.json"), recursive=True):
-            r = json.load(open(p))
-            a, s = r["args"], r["summary"]
-            if "q_test" not in s:
-                continue
-            cfg = (a.get("layers", 2), form(a))
-            nz = _ms([bits_nz(x) for x in r["per_seed"]])
-            grp[(a["dataset"], a.get("model", "gcn"), round(r["m_target_kb"], 1))][cfg] = (
-                s, nz, s["memory_kb_eq4"]["mean"] / r["m_target_kb"])
-    print("| dataset | model | budget KB | 2 layers | 4 plain | 4 residual | M end / budget |")
-    print("|---|---|---|---|---|---|---|")
-    for k in sorted(grp):
-        cells, ratios = [], []
-        for cfg in [(2, "plain"), (4, "plain"), (4, "pre")]:
-            if cfg not in grp[k]:
-                cells.append("–")
-                continue
-            s, nz, ratio = grp[k][cfg]
-            ratios.append(ratio)
-            cells.append(f"{100 * s['q_test']['mean']:.2f} ± {100 * s['q_test']['std']:.2f} @ {nz['mean']:.2f}")
-        rr = f"{min(ratios):.3f}–{max(ratios):.3f}" if ratios else "–"
-        print(f"| {k[0]} | {k[1]} | {k[2]:.0f} | " + " | ".join(cells) + f" | {rr} |")
-
-
 def main(argv=None):
     argv = list(argv if argv is not None else sys.argv[1:])
     curves = "--curves" in argv
-    dirs = [a for a in argv if not a.startswith("--")] or ["runs/res4", "runs/resstudy"]
-    if "--matched" in argv:
-        return print_matched(dirs)
+    dirs = [a for a in argv if a != "--curves"] or ["runs/res4", "runs/resstudy"]
     rows = collect(dirs)
     print_curves(rows) if curves else print_tables(rows)
 
