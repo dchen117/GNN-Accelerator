@@ -114,6 +114,11 @@ def parse_args(argv=None):
     p.add_argument("--epochs-fp32", type=int, default=200)
     p.add_argument("--epochs-qat", type=int, default=200)
     p.add_argument("--lam", type=float, default=0.0, help="λ in Eq.(5); 0 = no memory penalty")
+    p.add_argument("--lam-rel", type=float, default=None,
+                   help="set λ = lam_rel / M_target², i.e. penalty lam_rel·((M − M_target)/M_target)². "
+                        "Scale-free: the same value pins M to a reachable M_target on any dataset "
+                        "(300 ≈ λ 1e-5 on Roman-Empire 4-layer, which held M within 0.06%%). "
+                        "Residual work only (2026-11-27); MEGA-baseline runs use --lam")
     g = p.add_mutually_exclusive_group()
     g.add_argument("--m-target-kb", type=float, help="M_target in KB (Eq.(4), dense)")
     g.add_argument("--target-dense-bits", type=float,
@@ -267,6 +272,9 @@ def main(argv=None):
         m_target = g.num_nodes * sum(dims[:-1]) * args.target_dense_bits / ETA
     else:
         m_target = args.m_target_kb if args.m_target_kb is not None else 0.0
+    if args.lam_rel is not None:
+        assert m_target > 0, "--lam-rel needs an M_target"
+        args.lam = args.lam_rel / m_target ** 2
     if args.lam > 0:
         print(f"M_target = {m_target:.1f} KB, λ = {args.lam}")
 
